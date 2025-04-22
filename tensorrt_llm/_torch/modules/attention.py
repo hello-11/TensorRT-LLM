@@ -485,13 +485,25 @@ class MLA(nn.Module):
         q: torch.Tensor,
         k_pe: torch.Tensor,
         position_ids: torch.Tensor,
+        q_out: torch.Tensor = None,
+        k_out: torch.Tensor = None,
     ) -> torch.Tensor:
         q = q.view(-1, self.num_heads, self.qk_head_dim)
         q_pe = q[..., self.qk_nope_head_dim:].reshape(
             -1, self.num_heads * self.qk_rope_head_dim)
         q_pe, k_pe = self.rotary_emb(position_ids, [q_pe, k_pe])
-        q[..., self.qk_nope_head_dim:] = q_pe.view(-1, self.num_heads,
-                                                   self.qk_rope_head_dim)
+        if q_out is not None:
+            q_out[..., self.kv_lora_rank:] = q_pe.view(-1, self.num_heads,
+                                                       self.qk_rope_head_dim)
+        else:
+            q[..., self.qk_nope_head_dim:] = q_pe.view(-1, self.num_heads,
+                                                       self.qk_rope_head_dim)
+        if k_out is not None:
+            k_out[...,
+                  -self.qk_rope_head_dim:] = k_pe.view(-1, self.num_heads,
+                                                       self.qk_rope_head_dim)
+            return None
+
         return k_pe
 
     def forward(
@@ -547,12 +559,13 @@ class MLA(nn.Module):
             q_gen = q[num_ctx_tokens:, ...]
             compressed_kv_gen = compressed_kv[num_ctx_tokens:, ...]
             k_pe_gen = k_pe[num_ctx_tokens:, ...]
-            if self.apply_rotary_emb:
-                assert position_ids is not None
-                k_pe_gen = self.apply_rope(q_gen, k_pe_gen, position_ids)
+            # if self.apply_rotary_emb:
+            #     assert position_ids is not None
+            #     k_pe_gen = self.apply_rope(q_gen, k_pe_gen, position_ids)
 
             attn_output_gen = self.forward_generation(q_gen, compressed_kv_gen,
-                                                      k_pe_gen, attn_metadata)
+                                                      k_pe_gen, attn_metadata,
+                                                      position_ids)
         else:
             attn_output_gen = None
 
@@ -639,22 +652,23 @@ class MLA(nn.Module):
         compressed_kv: torch.Tensor,
         k_pe: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        position_ids: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
         q_nope, q_pe = q.view([-1, self.num_heads, self.qk_head_dim]).split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        # fused_q contains 1) the result of the following bmm with shape [num_tokens, num_heads, kv_lora_rank]
+        # 2) rope(q_pe) with shape [num_tokens, num_heads, qk_rope_head_dim]. rope is applied inside AttentionOp
+        fused_q = torch.empty(
+            [
+                num_tokens, self.num_heads,
+                (self.kv_lora_rank + self.qk_rope_head_dim)
+            ],
+            dtype=q.dtype,
+            device=q.device,
+        )
 
         def _run_bmm():
-            # fused_q contains 1) the result of the following bmm with shape [num_tokens, num_heads, kv_lora_rank]
-            # 2) rope(q_pe) with shape [num_tokens, num_heads, qk_rope_head_dim]. rope is applied inside AttentionOp
-            fused_q = torch.empty(
-                [
-                    num_tokens, self.num_heads,
-                    (self.kv_lora_rank + self.qk_rope_head_dim)
-                ],
-                dtype=q.dtype,
-                device=q.device,
-            )
             if self.k_b_proj_trans.dtype == torch.bfloat16:
                 # [num_heads, num_tokens, self.qk_nope_head_dim]
                 q_nope_t = q_nope.transpose(0, 1)
@@ -681,25 +695,34 @@ class MLA(nn.Module):
                 raise NotImplementedError(
                     f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}.")
 
-            if self.apply_rotary_emb:
-                fused_q[..., self.kv_lora_rank:] = q_pe
-            fused_q = fused_q.view([
-                num_tokens,
-                self.num_heads * (self.kv_lora_rank + self.qk_rope_head_dim)
-            ])
-            return fused_q
+            # if self.apply_rotary_emb:
+            #     fused_q[..., self.kv_lora_rank:] = q_pe
+
+            # return fused_q
+            return None
 
         def _concat_kv_cache():
             latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
+            if self.apply_rotary_emb:
+                assert position_ids is not None
+                _ = self.apply_rope(q,
+                                    k_pe,
+                                    position_ids,
+                                    q_out=fused_q,
+                                    k_out=latent_cache)
             return latent_cache
 
-        fused_q, latent_cache = maybe_execute_in_parallel(
+        _, latent_cache = maybe_execute_in_parallel(
             _run_bmm,
             _concat_kv_cache,
             self.ln_events[0],
             self.ln_events[1],
             self.aux_stream,
         )
+        fused_q = fused_q.view([
+            num_tokens,
+            self.num_heads * (self.kv_lora_rank + self.qk_rope_head_dim)
+        ])
 
         # out_scale = getattr(self.o_proj, "inv_input_scale", None)
         out_scale = None  # Although we use FP8 MLA for generation phase, the output is still in BF16
