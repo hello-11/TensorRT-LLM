@@ -531,7 +531,7 @@ class MLA(nn.Module):
                 self.aux_stream,
             )
 
-        q = self.q_b_proj(q)
+        # q = self.q_b_proj(q)
 
         # split q, k, v into context and gen batches
         num_contexts = attn_metadata.num_contexts
@@ -546,12 +546,20 @@ class MLA(nn.Module):
             q_ctx = q[:num_ctx_tokens, ...]
             compressed_kv_ctx = compressed_kv[:num_ctx_tokens, ...]
             k_pe_ctx = k_pe[:num_ctx_tokens, ...]
+            q_ctx, latent_cache_ctx = maybe_execute_in_parallel(
+                lambda: self.q_b_proj(q_ctx),
+                lambda: torch.concat([compressed_kv_ctx, k_pe_ctx], dim=-1),
+                self.ln_events[0],
+                self.ln_events[1],
+                self.aux_stream,
+            )
             if self.apply_rotary_emb:
                 assert position_ids is not None
                 k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, position_ids)
 
             attn_output_context = self.forward_context(q_ctx, compressed_kv_ctx,
-                                                       k_pe_ctx, attn_metadata)
+                                                       k_pe_ctx, attn_metadata,
+                                                       latent_cache_ctx)
         else:
             attn_output_context = None
 
@@ -559,13 +567,21 @@ class MLA(nn.Module):
             q_gen = q[num_ctx_tokens:, ...]
             compressed_kv_gen = compressed_kv[num_ctx_tokens:, ...]
             k_pe_gen = k_pe[num_ctx_tokens:, ...]
+            q_gen, latent_cache_gen = maybe_execute_in_parallel(
+                lambda: self.q_b_proj(q_gen),
+                lambda: torch.concat([compressed_kv_gen, k_pe_gen], dim=-1),
+                self.ln_events[0],
+                self.ln_events[1],
+                self.aux_stream,
+            )
             # if self.apply_rotary_emb:
             #     assert position_ids is not None
             #     k_pe_gen = self.apply_rope(q_gen, k_pe_gen, position_ids)
 
             attn_output_gen = self.forward_generation(q_gen, compressed_kv_gen,
                                                       k_pe_gen, attn_metadata,
-                                                      position_ids)
+                                                      position_ids,
+                                                      latent_cache_gen)
         else:
             attn_output_gen = None
 
@@ -608,8 +624,9 @@ class MLA(nn.Module):
         compressed_kv: torch.Tensor,
         k_pe: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        latent_cache: torch.Tensor,
     ) -> torch.Tensor:
-        latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
+        # latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
 
         kv = self.kv_b_proj(compressed_kv)
         k_nope, v = kv.split(
@@ -652,8 +669,10 @@ class MLA(nn.Module):
         compressed_kv: torch.Tensor,
         k_pe: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        position_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor],
+        latent_cache: torch.Tensor,
     ) -> torch.Tensor:
+        # latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
         num_tokens = q.shape[0]
         q_nope, q_pe = q.view([-1, self.num_heads, self.qk_head_dim]).split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
@@ -701,8 +720,7 @@ class MLA(nn.Module):
             # return fused_q
             return None
 
-        def _concat_kv_cache():
-            latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
+        def _separate_apply_rope():
             if self.apply_rotary_emb:
                 assert position_ids is not None
                 _ = self.apply_rope(q,
@@ -710,11 +728,11 @@ class MLA(nn.Module):
                                     position_ids,
                                     q_out=fused_q,
                                     k_out=latent_cache)
-            return latent_cache
+            return None
 
-        _, latent_cache = maybe_execute_in_parallel(
+        result1, result2 = maybe_execute_in_parallel(
             _run_bmm,
-            _concat_kv_cache,
+            _separate_apply_rope,
             self.ln_events[0],
             self.ln_events[1],
             self.aux_stream,
