@@ -568,7 +568,9 @@ class MLA(nn.Module):
             is_neox=pos_embd_params.is_neox,
         )
         self.apply_rotary_emb = not self.enable_rope_fusion
-
+        self.use_unfused_mla = True
+        self.softmax_scale = self.qk_head_dim**-0.5
+        
         if not config.skip_create_weights_in_init:
             self.create_weights()
 
@@ -722,7 +724,8 @@ class MLA(nn.Module):
 
             attn_output_gen = self.forward_generation(q_gen, compressed_kv_gen,
                                                       k_pe_gen, attn_metadata,
-                                                      latent_cache_gen)
+                                                      latent_cache_gen,
+                                                      position_ids)
         else:
             attn_output_gen = None
 
@@ -756,6 +759,48 @@ class MLA(nn.Module):
             qkv = torch.concat([q, k, v], dim=-1)
             q, k, v = qkv, None, None
         return q, k, v
+    
+    def _single_request_update_kv_cache(self, kv, k_pe, kv_cache_tensor,
+                                        cache_idx, start_pos, end_pos):
+        kv_cache = kv_cache_tensor[cache_idx,
+                                   0, :, :, :self.kv_lora_rank].squeeze()
+        pe_cache = kv_cache_tensor[cache_idx, 0, :, :,
+                                   self.kv_lora_rank:].squeeze()
+        kv_cache[start_pos:end_pos] = kv
+        pe_cache[start_pos:end_pos] = k_pe
+        return kv_cache[:end_pos, :], pe_cache[:end_pos, :]
+
+    def _single_request_unfused_mla(self, single_q: torch.Tensor,
+                                    latent_cache: torch.Tensor,
+                                    kv_cache_tensor: torch.Tensor,
+                                    start_pos: int, cache_idx: int):
+        seqlen, _, _ = single_q.size()
+        end_pos = start_pos + seqlen
+        # get mask
+        mask = None
+        if seqlen > 1:
+            mask = torch.full((end_pos, end_pos), float("-inf"),
+                              device='cuda').triu_(1)
+            mask = mask[-seqlen:]
+
+        q_nope = single_q[..., :self.kv_lora_rank]
+        q_pe = single_q[..., self.kv_lora_rank:]
+        kv = latent_cache[..., :self.kv_lora_rank]
+        k_pe = latent_cache[..., -self.qk_rope_head_dim:]
+
+        # update kv cache
+        kv_states, pe_states = self._single_request_update_kv_cache(
+            kv, k_pe.squeeze(1), kv_cache_tensor, cache_idx, start_pos, end_pos)
+
+        # attention
+        scores = (torch.einsum("shc,tc->sht", q_nope, kv_states) + torch.einsum(
+            "shr,tr->sht", q_pe, pe_states)) * self.softmax_scale
+        if mask is not None:
+            scores += mask.unsqueeze(1)
+        scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(single_q)
+        x = torch.einsum("sht,tc->shc", scores, kv_states)
+
+        return x
 
     def forward_context_default(
         self,
@@ -947,6 +992,7 @@ class MLA(nn.Module):
         k_pe: torch.Tensor,
         attn_metadata: AttentionMetadata,
         latent_cache: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
         q_nope, q_pe = q.view([-1, self.num_heads, self.qk_head_dim]).split(
@@ -999,18 +1045,66 @@ class MLA(nn.Module):
         # out_scale = getattr(self.o_proj, "inv_input_scale", None)
         out_scale = None  # Although we use FP8 MLA for generation phase, the output is still in BF16
 
-        attn_out_latent = self.mqa.forward(
-            fused_q,
-            None,
-            None,
-            attn_metadata,
-            attention_input_type=AttentionInputType.generation_only,
-            out_scale=out_scale,
-            latent_cache=latent_cache,  # kvcache and k_pe
-            q_pe=q_pe,  # used by `invokeMLARopeGeneration`
-        )
-        fused_q = None
+        if self.use_unfused_mla:
+            q_nope, _ = fused_q.view([
+                num_tokens, self.num_heads,
+                self.kv_lora_rank + self.qk_rope_head_dim
+            ]).split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+            q_pe = q_pe.reshape(-1, self.num_heads * self.qk_rope_head_dim)
+            k_pe = latent_cache[..., -self.qk_rope_head_dim:]
+            if not self.apply_rotary_emb:
+                assert position_ids is not None
+                q_pe, k_pe = self.rotary_emb(position_ids, [q_pe, k_pe])
+                fused_q = fused_q.view(
+                    -1, self.num_heads,
+                    self.kv_lora_rank + self.qk_rope_head_dim)
+                fused_q[...,
+                        self.kv_lora_rank:] = q_pe.view(-1, self.num_heads,
+                                                        self.qk_rope_head_dim)
+                latent_cache[..., -self.qk_rope_head_dim:] = k_pe
+            attn_metadata.kv_cache_manager.max_seq_len
+            past_seen_tokens = attn_metadata.kv_cache_params.num_cached_tokens_per_seq
+            block_ids_per_seq = attn_metadata.kv_cache_manager.get_block_ids_per_seq(
+                attn_metadata.request_ids).pin_memory()
+            block_ids_per_seq.shape[1]
+            assert attn_metadata.request_ids is not None
+            cache_indices = [
+                block_ids[0] for block_ids in attn_metadata.kv_cache_manager.
+                get_block_ids_per_seq(attn_metadata.request_ids).pin_memory()
+            ]
+            kv_cache_tensor = attn_metadata.kv_cache_manager.get_buffers(
+                self.layer_idx)
 
+            assert len(cache_indices) == len(past_seen_tokens)
+            assert len(cache_indices) == attn_metadata.seq_lens.nelement()
+            offset = 0
+            attn_outputs = []
+            for i, seq_len in enumerate(attn_metadata.seq_lens):
+                single_q = fused_q[offset:offset + seq_len, ...]
+                latent_cache = latent_cache[offset:offset + seq_len, ...]
+                past_seen_token = past_seen_tokens[i]
+                cache_idx = cache_indices[i]
+                attn_out_latent = self._single_request_unfused_mla(
+                    single_q, latent_cache, kv_cache_tensor, past_seen_token,
+                    cache_idx)
+                attn_outputs.append(attn_out_latent)
+                offset += seq_len
+
+            attn_out_latent = torch.cat(attn_outputs, dim=0).contiguous()
+            attn_out_latent = attn_out_latent.view(
+                -1, attn_out_latent.shape[1] * attn_out_latent.shape[2])
+        else:
+            attn_out_latent = self.mqa.forward(
+                fused_q,
+                None,
+                None,
+                attn_metadata,
+                attention_input_type=AttentionInputType.generation_only,
+                out_scale=out_scale,
+                latent_cache=latent_cache,  # kvcache and k_pe
+                q_pe=q_pe,  # used by `invokeMLARopeGeneration`
+            )
+        fused_q = None
         assert (attn_out_latent.shape[0] == q.shape[0] and
                 attn_out_latent.shape[1] == self.num_heads * self.kv_lora_rank)
 
