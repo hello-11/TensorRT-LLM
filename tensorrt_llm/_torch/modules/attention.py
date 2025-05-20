@@ -518,6 +518,7 @@ class MLA(nn.Module):
         scaling_factor = pos_embd_params.rope.scale
         mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
         q_scaling = 1.0 / (mscale * mscale)
+        self.q_scaling = q_scaling
 
         self.mha = create_attention(
             config.attn_backend,
@@ -569,7 +570,7 @@ class MLA(nn.Module):
         )
         self.apply_rotary_emb = not self.enable_rope_fusion
         self.use_unfused_mla = True
-        self.softmax_scale = self.qk_head_dim**-0.5
+        self.softmax_scale = self.qk_head_dim**0.5
         
         if not config.skip_create_weights_in_init:
             self.create_weights()
@@ -787,19 +788,28 @@ class MLA(nn.Module):
         q_pe = single_q[..., self.kv_lora_rank:]
         kv = latent_cache[..., :self.kv_lora_rank]
         k_pe = latent_cache[..., -self.qk_rope_head_dim:]
+        # k_pe = k_pe.squeeze(1)
 
         # update kv cache
         kv_states, pe_states = self._single_request_update_kv_cache(
             kv, k_pe.squeeze(1), kv_cache_tensor, cache_idx, start_pos, end_pos)
 
         # attention
-        scores = (torch.einsum("shc,tc->sht", q_nope, kv_states) + torch.einsum(
-            "shr,tr->sht", q_pe, pe_states)) * self.softmax_scale
+        # scores1 = (torch.einsum("shc,tc->sht", q_nope, kv_states) + torch.einsum(
+        #     "shr,tr->sht", q_pe, pe_states)) / (self.softmax_scale * self.q_scaling)
+        # if mask is not None:
+        #     scores1 += mask.unsqueeze(1)
+        # scores = scores1.softmax(dim=-1, dtype=torch.float32).type_as(single_q)
+        scores11 = torch.einsum("shc,tc->sht", q_nope, kv_states)
+        scores12 = torch.einsum("shr,tr->sht", q_pe, pe_states)
+        scores1 = scores11 + scores12
+        scores1_scaled = scores1 / (self.softmax_scale * self.q_scaling)
         if mask is not None:
-            scores += mask.unsqueeze(1)
-        scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(single_q)
-        x = torch.einsum("sht,tc->shc", scores, kv_states)
-
+            scores1_scaled += mask.unsqueeze(1)
+        scores1_scaled_softmax = scores1_scaled.softmax(
+            dim=-1, dtype=torch.float32).type_as(single_q)
+        x = torch.einsum("sht,tc->shc", scores1_scaled_softmax, kv_states)
+        # pdb.set_trace()
         return x
 
     def forward_context_default(
@@ -1044,8 +1054,18 @@ class MLA(nn.Module):
 
         # out_scale = getattr(self.o_proj, "inv_input_scale", None)
         out_scale = None  # Although we use FP8 MLA for generation phase, the output is still in BF16
-
         if self.use_unfused_mla:
+            past_seen_tokens = attn_metadata.kv_cache_params.num_cached_tokens_per_seq
+            assert attn_metadata.request_ids is not None
+            cache_indices = [
+                block_ids[0] for block_ids in attn_metadata.kv_cache_manager.
+                get_block_ids_per_seq(attn_metadata.request_ids).pin_memory()
+            ]
+            kv_cache_tensor = attn_metadata.kv_cache_manager.get_buffers(
+                self.layer_idx)
+            assert len(cache_indices) == len(past_seen_tokens)
+            assert len(cache_indices) == attn_metadata.seq_lens.nelement()
+
             q_nope, _ = fused_q.view([
                 num_tokens, self.num_heads,
                 self.kv_lora_rank + self.qk_rope_head_dim
@@ -1058,25 +1078,16 @@ class MLA(nn.Module):
                 fused_q = fused_q.view(
                     -1, self.num_heads,
                     self.kv_lora_rank + self.qk_rope_head_dim)
+                q_pe = q_pe.view(-1, self.num_heads, self.qk_rope_head_dim // 2,
+                                 2).transpose(3, 2).reshape(
+                                     -1, self.num_heads, self.qk_rope_head_dim)
+                k_pe = k_pe.view(-1, self.qk_rope_head_dim // 2, 2).transpose(
+                    2, 1).reshape(-1, self.qk_rope_head_dim)
                 fused_q[...,
                         self.kv_lora_rank:] = q_pe.view(-1, self.num_heads,
                                                         self.qk_rope_head_dim)
                 latent_cache[..., -self.qk_rope_head_dim:] = k_pe
-            attn_metadata.kv_cache_manager.max_seq_len
-            past_seen_tokens = attn_metadata.kv_cache_params.num_cached_tokens_per_seq
-            block_ids_per_seq = attn_metadata.kv_cache_manager.get_block_ids_per_seq(
-                attn_metadata.request_ids).pin_memory()
-            block_ids_per_seq.shape[1]
-            assert attn_metadata.request_ids is not None
-            cache_indices = [
-                block_ids[0] for block_ids in attn_metadata.kv_cache_manager.
-                get_block_ids_per_seq(attn_metadata.request_ids).pin_memory()
-            ]
-            kv_cache_tensor = attn_metadata.kv_cache_manager.get_buffers(
-                self.layer_idx)
 
-            assert len(cache_indices) == len(past_seen_tokens)
-            assert len(cache_indices) == attn_metadata.seq_lens.nelement()
             offset = 0
             attn_outputs = []
             for i, seq_len in enumerate(attn_metadata.seq_lens):
