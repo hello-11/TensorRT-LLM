@@ -571,7 +571,7 @@ class MLA(nn.Module):
         self.apply_rotary_emb = not self.enable_rope_fusion
         self.use_unfused_mla = True
         self.softmax_scale = self.qk_head_dim**0.5
-        
+
         if not config.skip_create_weights_in_init:
             self.create_weights()
 
@@ -760,7 +760,7 @@ class MLA(nn.Module):
             qkv = torch.concat([q, k, v], dim=-1)
             q, k, v = qkv, None, None
         return q, k, v
-    
+
     def _single_request_update_kv_cache(self, kv, k_pe, kv_cache_tensor,
                                         cache_idx, start_pos, end_pos):
         kv_cache = kv_cache_tensor[cache_idx,
@@ -1078,11 +1078,11 @@ class MLA(nn.Module):
                 fused_q = fused_q.view(
                     -1, self.num_heads,
                     self.kv_lora_rank + self.qk_rope_head_dim)
-                q_pe = q_pe.view(-1, self.num_heads, self.qk_rope_head_dim // 2,
-                                 2).transpose(3, 2).reshape(
-                                     -1, self.num_heads, self.qk_rope_head_dim)
-                k_pe = k_pe.view(-1, self.qk_rope_head_dim // 2, 2).transpose(
-                    2, 1).reshape(-1, self.qk_rope_head_dim)
+                # q_pe = q_pe.view(-1, self.num_heads, self.qk_rope_head_dim // 2,
+                #                  2).transpose(3, 2).reshape(
+                #                      -1, self.num_heads, self.qk_rope_head_dim)
+                # k_pe = k_pe.view(-1, self.qk_rope_head_dim // 2, 2).transpose(
+                #     2, 1).reshape(-1, self.qk_rope_head_dim)
                 fused_q[...,
                         self.kv_lora_rank:] = q_pe.view(-1, self.num_heads,
                                                         self.qk_rope_head_dim)
