@@ -125,7 +125,7 @@ def create_py_executor(executor_config: ExecutorConfig,
         #NOTE: non-generation models do not have kv cache
         executor_config.pytorch_backend_config.use_kv_cache = False
 
-    executor_config.tokens_per_block = 2048
+    executor_config.tokens_per_block = 4096
     if executor_config.enable_chunked_context:
         chunk_unit_size = executor_config.tokens_per_block
         chunking_policy = (

@@ -806,8 +806,10 @@ class MLA(nn.Module):
         scores1_scaled = scores1 / (self.softmax_scale * self.q_scaling)
         if mask is not None:
             scores1_scaled += mask.unsqueeze(1)
-        scores1_scaled_softmax = scores1_scaled.softmax(
-            dim=-1, dtype=torch.float32).type_as(single_q)
+        # scores1_scaled_softmax = scores1_scaled.softmax(
+        #     dim=-1, dtype=torch.float32).type_as(single_q)
+        scores1_scaled_softmax = torch.ops.trtllm.deepseekr1_softmax(
+            scores1_scaled, dim=-1)
         x = torch.einsum("sht,tc->shc", scores1_scaled_softmax, kv_states)
         # pdb.set_trace()
         return x
