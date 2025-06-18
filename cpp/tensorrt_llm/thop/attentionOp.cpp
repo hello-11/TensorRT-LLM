@@ -301,6 +301,7 @@ public:
             enqueue_params.cache_indir = beam_width == 1 ? nullptr : cache_indirection.value().data_ptr<int32_t>();
             enqueue_params.semaphores = op.multiBlockSemaphores();
             enqueue_params.host_past_key_value_lengths = host_past_key_value_lengths.data_ptr<int32_t>();
+            enqueue_params.host_block_offsets = host_block_offsets;
 
             if (op.isMRoPE() && mrope_position_deltas.has_value())
             {
@@ -537,7 +538,9 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
 
     int32_t const max_attention_window_size
         = beam_width == 1 ? attention_window_size : cache_indirection.value().size(2);
-    int64_t const workspace_size = runner->getWorkspaceSize(*op, num_tokens, max_attention_window_size, num_gen_tokens);
+    int max_num_gen_tokens = num_gen_tokens;
+    int64_t const workspace_size = runner->getWorkspaceSize(*op, num_tokens, max_attention_window_size, num_gen_tokens)
+        + max_num_gen_tokens * num_heads * host_past_key_value_lengths.item<int32_t>() * 2 * 2;
     TLLM_LOG_TRACE("Expected workspace size is %ld bytes", workspace_size);
 
     if (workspace_size >= (16l << 30))

@@ -569,7 +569,7 @@ class MLA(nn.Module):
             is_neox=pos_embd_params.is_neox,
         )
         self.apply_rotary_emb = not self.enable_rope_fusion
-        self.use_unfused_mla = True
+        self.use_unfused_mla = False
         self.softmax_scale = self.qk_head_dim**0.5
 
         if not config.skip_create_weights_in_init:

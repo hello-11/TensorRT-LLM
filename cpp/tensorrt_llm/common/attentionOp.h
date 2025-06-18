@@ -184,6 +184,7 @@ public:
     class EnqueueGenerationParams : public EnqueueParams<T>
     {
     public:
+        kernels::KVBlockArray::DataType* host_block_offsets = nullptr;
         int32_t beam_width = 1;
         // Attention mask has shape of [batch_size, attention_mask_stride].
         int32_t attention_mask_stride = 0;
