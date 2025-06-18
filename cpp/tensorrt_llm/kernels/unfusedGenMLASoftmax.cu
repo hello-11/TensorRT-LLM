@@ -119,7 +119,7 @@ __global__ void basic_unfused_gen_mla_softmax_kernel<__nv_bfloat16>(__nv_bfloat1
     // First pass: find max value
     for (int i = col; i < max_kv_seq_len; i += blockDim.x)
     {
-        float val = i < valid_kv_len ? static_cast<float>(input[q_id * max_kv_seq_len + i]) : -INFINITY;
+        float val = i < valid_kv_len ? static_cast<float>(input[q_id * max_kv_seq_len + i]) * softmax_scale : -INFINITY;
         max_val = fmaxf(max_val, val);
     }
 
@@ -129,7 +129,7 @@ __global__ void basic_unfused_gen_mla_softmax_kernel<__nv_bfloat16>(__nv_bfloat1
     // Second pass: compute exp and sum
     for (int i = col; i < max_kv_seq_len; i += blockDim.x)
     {
-        float val = i < valid_kv_len ? static_cast<float>(input[q_id * max_kv_seq_len + i]) : -INFINITY;
+        float val = i < valid_kv_len ? static_cast<float>(input[q_id * max_kv_seq_len + i]) * softmax_scale : -INFINITY;
         val = i < valid_kv_len ? expf(val - max_val) : 0.0f;
         sum_val += val;
         output[q_id * max_kv_seq_len + i] = static_cast<__nv_bfloat16>(val);
