@@ -26,7 +26,7 @@ namespace unfused_gen_mla_softmax
 {
 template <typename T>
 void invokeUnfusedGenMLASoftmax(T const* input, T* output, int const* seqLensKvPtr, int q_seq_len, int max_kv_seq_len,
-    float softmax_scale, cudaStream_t stream);
+    float softmax_scale, int max_q_seq_len, int num_heads, cudaStream_t stream);
 
 } // namespace unfused_gen_mla_softmax
 } // namespace kernels

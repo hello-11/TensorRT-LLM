@@ -892,6 +892,7 @@ int AttentionOp::mlaGeneration(
         generation_params.max_cyclic_attention_window_size, generation_params.sink_token_length,
         generation_params.can_use_one_more_block, generation_params.host_primary_pool_pointer,
         generation_params.host_secondary_pool_pointer, generation_params.host_block_offsets);
+    // generation_params.host_secondary_pool_pointer, generation_params.block_offsets);
 
     // Workspace pointer shift
     int8_t* workspace_byte_ptr = reinterpret_cast<int8_t*>(params.workspace);
@@ -1003,7 +1004,7 @@ int AttentionOp::mlaGeneration(
             &beta, o_qkPtr, CUDA_R_16BF, n, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
 
         tensorrt_llm::kernels::unfused_gen_mla_softmax::invokeUnfusedGenMLASoftmax(reinterpret_cast<T const*>(o_qkPtr),
-            reinterpret_cast<T*>(o_softmaxPtr), seqLensKvPtr, m, n, softmax_scale, stream);
+            reinterpret_cast<T*>(o_softmaxPtr), seqLensKvPtr, m, n, softmax_scale, maxSeqLenQ, numHeadsQ, stream);
 
         cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, n2, m, n, &alpha, vPtr, CUDA_R_16BF, k, o_softmaxPtr,
             CUDA_R_16BF, n, &beta, oPtr, CUDA_R_16BF, n2, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);

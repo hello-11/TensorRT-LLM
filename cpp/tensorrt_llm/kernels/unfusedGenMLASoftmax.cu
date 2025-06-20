@@ -25,6 +25,8 @@
 
 #include <cuda_runtime_api.h>
 
+#include <math.h>
+
 namespace tensorrt_llm
 {
 namespace kernels
@@ -90,7 +92,8 @@ inline __device__ float blockReduceSum(float* shared, float val)
 
 template <typename T>
 __global__ void basic_unfused_gen_mla_softmax_kernel(T const* input, T* output, int const q_seq_len,
-    int const max_kv_seq_len, float const softmax_scale, int const* seqLensKvPtr)
+    int const max_kv_seq_len, float const softmax_scale, int const max_q_seq_len, int const num_heads,
+    int const* seqLensKvPtr)
 {
     return;
 }
@@ -98,10 +101,13 @@ __global__ void basic_unfused_gen_mla_softmax_kernel(T const* input, T* output, 
 #ifdef ENABLE_BF16
 template <>
 __global__ void basic_unfused_gen_mla_softmax_kernel<__nv_bfloat16>(__nv_bfloat16 const* input, __nv_bfloat16* output,
-    int const q_seq_len, int const max_kv_seq_len, float const softmax_scale, int const* seqLensKvPtr)
+    int const q_seq_len, int const max_kv_seq_len, float const softmax_scale, int const max_q_seq_len,
+    int const num_heads, int const* seqLensKvPtr)
 {
 
     int q_id = blockIdx.x;
+    int head_id = q_id % num_heads;
+    int token_id = q_id / num_heads;
     int valid_kv_len = seqLensKvPtr[0];
 
     if (q_id >= q_seq_len)
@@ -142,31 +148,45 @@ __global__ void basic_unfused_gen_mla_softmax_kernel<__nv_bfloat16>(__nv_bfloat1
     for (int i = col; i < valid_kv_len; i += blockDim.x)
     {
         float val = static_cast<float>(output[q_id * max_kv_seq_len + i]);
-        output[q_id * max_kv_seq_len + i] = static_cast<__nv_bfloat16>(val / (sum_val + 1e-5f));
+        float result_val = static_cast<__nv_bfloat16>(val / (sum_val + 1e-5f));
+        if (max_q_seq_len > 1)
+        {
+            int local_kv_col_id = i - (valid_kv_len - max_q_seq_len);
+            if (local_kv_col_id >= 0)
+            {
+                if (local_kv_col_id > token_id)
+                {
+                    result_val = 0.0f;
+                }
+            }
+        }
+
+        output[q_id * max_kv_seq_len + i] = result_val;
     }
 }
 #endif
 
 template <typename T>
 void invokeUnfusedGenMLASoftmax(T const* input, T* output, int const* seqLensKvPtr, int q_seq_len, int max_kv_seq_len,
-    float softmax_scale, cudaStream_t stream)
+    float softmax_scale, int max_q_seq_len, int num_heads, cudaStream_t stream)
 {
     dim3 grid(q_seq_len);
     dim3 block(256);
 
-    basic_unfused_gen_mla_softmax_kernel<T>
-        <<<grid, block, 0, stream>>>(input, output, q_seq_len, max_kv_seq_len, softmax_scale, seqLensKvPtr);
+    basic_unfused_gen_mla_softmax_kernel<T><<<grid, block, 0, stream>>>(
+        input, output, q_seq_len, max_kv_seq_len, softmax_scale, max_q_seq_len, num_heads, seqLensKvPtr);
 }
 
 template void invokeUnfusedGenMLASoftmax<float>(float const* input, float* output, int const* seqLensKvPtr,
-    int q_seq_len, int max_kv_seq_len, float softmax_scale, cudaStream_t stream);
+    int q_seq_len, int max_kv_seq_len, float softmax_scale, int max_q_seq_len, int num_heads, cudaStream_t stream);
 
 template void invokeUnfusedGenMLASoftmax<half>(half const* input, half* output, int const* seqLensKvPtr, int q_seq_len,
-    int max_kv_seq_len, float softmax_scale, cudaStream_t stream);
+    int max_kv_seq_len, float softmax_scale, int max_q_seq_len, int num_heads, cudaStream_t stream);
 
 #ifdef ENABLE_BF16
 template void invokeUnfusedGenMLASoftmax<__nv_bfloat16>(__nv_bfloat16 const* input, __nv_bfloat16* output,
-    int const* seqLensKvPtr, int q_seq_len, int max_kv_seq_len, float softmax_scale, cudaStream_t stream);
+    int const* seqLensKvPtr, int q_seq_len, int max_kv_seq_len, float softmax_scale, int max_q_seq_len, int num_heads,
+    cudaStream_t stream);
 #endif
 
 } // namespace unfused_gen_mla_softmax
