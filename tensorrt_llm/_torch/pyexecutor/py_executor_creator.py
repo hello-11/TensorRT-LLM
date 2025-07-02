@@ -317,6 +317,7 @@ def create_py_executor(
             if draft_model_engine is not None:
                 draft_model_engine.attn_runtime_features.chunked_prefill = False
 
+    executor_config.tokens_per_block = 4096 * 8
     if executor_config.enable_chunked_context:
         chunk_unit_size = executor_config.tokens_per_block
         chunking_policy = (
