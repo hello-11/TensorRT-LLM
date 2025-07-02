@@ -541,6 +541,9 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
     int max_num_gen_tokens = num_gen_tokens;
     int64_t const workspace_size = runner->getWorkspaceSize(*op, num_tokens, max_attention_window_size, num_gen_tokens)
         + max_num_gen_tokens * num_heads * host_past_key_value_lengths.item<int32_t>() * 2 * 2;
+    // int64_t const workspace_size = runner->getWorkspaceSize(*op, num_tokens, max_attention_window_size,
+    // num_gen_tokens)
+    //     + max_num_gen_tokens * num_heads * 4096 * 2 * 2;
     TLLM_LOG_TRACE("Expected workspace size is %ld bytes", workspace_size);
 
     if (workspace_size >= (16l << 30))

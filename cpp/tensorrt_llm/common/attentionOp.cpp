@@ -33,6 +33,9 @@
 #include <cstdint>
 #include <type_traits>
 
+#include "tensorrt_llm/common/cublasMMWrapper.h"
+#include "tensorrt_llm/common/opUtils.h"
+
 using namespace tensorrt_llm::kernels;
 namespace tc = tensorrt_llm::common;
 using tensorrt_llm::common::op::AttentionOp;
@@ -893,7 +896,6 @@ int AttentionOp::mlaGeneration(
         generation_params.can_use_one_more_block, generation_params.host_primary_pool_pointer,
         generation_params.host_secondary_pool_pointer, generation_params.host_block_offsets);
     // generation_params.host_secondary_pool_pointer, generation_params.block_offsets);
-
     // Workspace pointer shift
     int8_t* workspace_byte_ptr = reinterpret_cast<int8_t*>(params.workspace);
     size_t offset = 0;
@@ -982,36 +984,84 @@ int AttentionOp::mlaGeneration(
         void* o_qkPtr = nextWorkspacePtr(workspace_byte_ptr, offset, maxSeqLenQ * batch_beam * numHeadsQ * maxSeqLenKv);
         void* o_softmaxPtr
             = nextWorkspacePtr(workspace_byte_ptr, offset, maxSeqLenQ * batch_beam * numHeadsQ * maxSeqLenKv);
+        void* scratch_ptr = nextWorkspacePtr(workspace_byte_ptr, offset);
 
         void const* qPtr = mFP8GenerationMLA ? reinterpret_cast<void const*>(params.quant_attention_input_buf)
                                              : reinterpret_cast<void const*>(params.attention_input_buf);
         void const* kPtr = (kv_cache_buffer.getKBlockPtr(seq_id, 0));
         void const* vPtr = kPtr;
 
-        int m = maxSeqLenQ * batch_beam * numHeadsQ; // 32 * 1 * 16 * 1 = 512
-        int n = maxSeqLenKv;                         // 69 * 1 = 69
-        int k = headDimQk;                           // 576
-        int n2 = headDimV;                           // 512 * 1 = 512
+        int m = maxSeqLenQ * batch_beam * numHeadsQ;
+        int n = maxSeqLenKv;
+        int k = headDimQk; // 576
+        int n2 = headDimV; // 512 * 1 = 512
 
         float softmax_scale
             = 1.0f / (mQScaling * sqrtf((mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim) * 1.0f));
 
-        // Create cuBLAS handle
-        cublasHandle_t handle;
-        cublasCreate(&handle);
-        cublasSetStream(handle, stream);
-        cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, &alpha, kPtr, CUDA_R_16BF, k, qPtr, CUDA_R_16BF, k,
-            &beta, o_qkPtr, CUDA_R_16BF, n, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+        thread_local std::shared_ptr<CublasMMWrapper> cublasWrapper;
+        if (cublasWrapper == nullptr)
+        {
+            auto cublasHandle = getCublasHandle();
+            auto cublasLtHandle = getCublasLtHandle();
+            cublasWrapper = std::make_shared<CublasMMWrapper>(cublasHandle, cublasLtHandle, nullptr, nullptr);
+        }
 
+        cudaDataType_t aType = CUDA_R_16BF;
+        cudaDataType_t bType = CUDA_R_16BF;
+        cudaDataType_t outType = CUDA_R_16BF;
+        cublasComputeType_t compType = CUBLAS_COMPUTE_32F;
+        cudaDataType_t scaleType = CUDA_R_32F;
+        cublasWrapper->setGemmConfig(aType, bType, outType, /*computeType=*/scaleType);
+
+        cublasWrapper->setStream(stream);
+        // TODO... need to set workspace
+        cublasWrapper->setWorkspace(scratch_ptr);
+
+        // // swap A and B. A is column major, B is row major.
+        cublasWrapper->createDescriptors(
+            CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, /*lda=*/k, /*ldb=*/k, /*ldc=*/n, /*fastAcc=*/false);
+        cublasWrapper->Gemm(CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, /*A=*/kPtr, /*lda=*/k, /*B=*/qPtr, /*ldb=*/k, o_qkPtr,
+            /*ldc=*/n, 1.0F, 0.0F, {}, false, false);
+        cublasWrapper->destroyDescriptors();
         tensorrt_llm::kernels::unfused_gen_mla_softmax::invokeUnfusedGenMLASoftmax(reinterpret_cast<T const*>(o_qkPtr),
             reinterpret_cast<T*>(o_softmaxPtr), seqLensKvPtr, m, n, softmax_scale, maxSeqLenQ, numHeadsQ, stream);
 
-        cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, n2, m, n, &alpha, vPtr, CUDA_R_16BF, k, o_softmaxPtr,
-            CUDA_R_16BF, n, &beta, oPtr, CUDA_R_16BF, n2, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+        cublasWrapper->createDescriptors(
+            CUBLAS_OP_N, CUBLAS_OP_N, n2, m, n, /*lda=*/k, /*ldb=*/n, /*ldc=*/n2, /*fastAcc=*/false);
+        cublasWrapper->Gemm(CUBLAS_OP_N, CUBLAS_OP_N, n2, m, n, /*A=*/vPtr, /*lda=*/k, /*B=*/o_softmaxPtr, /*ldb=*/n,
+            oPtr,
+            /*ldc=*/n2, 1.0F, 0.0F, {}, false, false);
+        cublasWrapper->destroyDescriptors();
+
+        // cublasSetStream(cublasWrapper->getCublasHandle(), stream);
+        // cublasGemmEx(cublasWrapper->getCublasHandle(), CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, &alpha, kPtr, CUDA_R_16BF,
+        // k,
+        //     qPtr, CUDA_R_16BF, k, &beta, o_qkPtr, CUDA_R_16BF, n, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+
+        // tensorrt_llm::kernels::unfused_gen_mla_softmax::invokeUnfusedGenMLASoftmax(reinterpret_cast<T
+        // const*>(o_qkPtr),
+        //     reinterpret_cast<T*>(o_softmaxPtr), seqLensKvPtr, m, n, softmax_scale, maxSeqLenQ, numHeadsQ, stream);
+
+        // cublasGemmEx(cublasWrapper->getCublasHandle(), CUBLAS_OP_N, CUBLAS_OP_N, n2, m, n, &alpha, vPtr, CUDA_R_16BF,
+        // k,
+        //     o_softmaxPtr, CUDA_R_16BF, n, &beta, oPtr, CUDA_R_16BF, n2, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+
+        // Create cuBLAS handle
+        // cublasHandle_t handle;
+        // cublasCreate(&handle);
+        // cublasSetStream(handle, stream);
+        // cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, &alpha, kPtr, CUDA_R_16BF, k, qPtr, CUDA_R_16BF,
+        //     k, &beta, o_qkPtr, CUDA_R_16BF, n, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+
+        // tensorrt_llm::kernels::unfused_gen_mla_softmax::invokeUnfusedGenMLASoftmax(reinterpret_cast<T
+        // const*>(o_qkPtr),
+        //     reinterpret_cast<T*>(o_softmaxPtr), seqLensKvPtr, m, n, softmax_scale, maxSeqLenQ, numHeadsQ, stream);
+
+        // cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, n2, m, n, &alpha, vPtr, CUDA_R_16BF, k, o_softmaxPtr,
+        //     CUDA_R_16BF, n, &beta, oPtr, CUDA_R_16BF, n2, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
 
         sync_check_cuda_error(stream);
-
-        cublasDestroy(handle);
 
         return 0;
     }
