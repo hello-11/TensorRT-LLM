@@ -5130,6 +5130,141 @@ def test_moe_module_locality_domain_lifecycle_and_forward_rubin(quant_algo, rtol
 
 
 @pytest.mark.skipif(
+    get_sm_version() != 107 or not IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE,
+    reason="MXFP8 fused FC12 MoE requires Rubin (SM107) with a CuTe DSL build that supports the fused FC12 kernel",
+)
+@pytest.mark.parametrize("num_tokens", [16, 4096])
+def test_moe_module_mxfp8_locality_domain_static_split_rubin(num_tokens: int):
+    """Locality domains for an MXFP8 layer are a static planner decision, as for NVFP4/BF16.
+
+    ``transform_weights`` shards the weights onto the two partitions and
+    releases the full parameters and block scales (the shards are the only
+    copy), and every shape runs the split, prefill-sized rows included. A
+    refit reload after the release re-creates the full parameters, and the
+    next transform re-shards and releases them again.
+    """
+    _skip_if_no_locality_domain()
+
+    from _torch.moe.quantize_utils import get_test_quant_params
+    from transformers.configuration_utils import PretrainedConfig
+
+    from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.moe.fused_moe import RenormalizeMoeRoutingMethod
+    from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe
+    from tensorrt_llm._utils import mpi_rank
+    from tensorrt_llm.mapping import Mapping
+
+    hidden_size, intermediate_size, num_experts, top_k = 2048, 1536, 64, 4
+    dtype = torch.bfloat16
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+        x = torch.randn((num_tokens, hidden_size), dtype=dtype, device="cuda")
+        router_logits = torch.randn((num_tokens, num_experts), dtype=dtype, device="cuda")
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            QuantAlgo.MXFP8, x, "CUTEDSL"
+        )
+        weights = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+        ).create_weights(**quant_kwargs)
+        pretrained_config = PretrainedConfig()
+        pretrained_config.num_experts = num_experts
+        pretrained_config.hidden_size = hidden_size
+        pretrained_config.intermediate_size = intermediate_size
+        pretrained_config.torch_dtype = dtype
+
+        def create_module(enable_locality_domains: bool):
+            model_config = ModelConfig(
+                pretrained_config=pretrained_config,
+                quant_config=quant_config,
+                mapping=mapping,
+                moe_backend="CUTEDSL",
+                locality_domain_policy=LocalityDomainPolicy(enabled=enable_locality_domains),
+            )
+            moe = create_moe(
+                routing_method=routing_method,
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                dtype=dtype,
+                reduce_results=True,
+                model_config=model_config,
+                allow_backend_degradation=False,
+            )
+            assert isinstance(moe.backend, TrtllmCutedslFusedFc12Mxfp8Impl)
+            moe.create_weights()
+            moe.load_weights([weights])
+            moe.transform_weights()
+            moe.cache_derived_state()
+            moe.cuda()
+            return moe
+
+        base_module = create_module(False)
+        split_module = create_module(True)
+        base_backend = base_module.backend
+        split_backend = split_module.backend
+        assert base_backend._locality_domain_weight_shards is None
+        shards = split_backend._locality_domain_weight_shards
+        assert shards is not None and len(shards) == 2
+
+        def assert_released(backend):
+            for name in ("w3_w1_weight", "w2_weight", "w3_w1_weight_scale", "w2_weight_scale"):
+                assert getattr(backend, name).numel() == 0, name
+            assert backend.quant_scales.fc31_weight_block_scale.numel() == 0
+            assert backend.quant_scales.fc2_weight_block_scale.numel() == 0
+
+        assert_released(split_backend)
+        # The shards together are exactly one copy of the full weights.
+        assert torch.equal(
+            torch.cat([s["w3_w1_weight"] for s in shards], dim=1).view(torch.uint8),
+            base_backend.w3_w1_weight.view(torch.uint8),
+        )
+        assert torch.equal(
+            torch.cat([s["w2_weight"] for s in shards], dim=2).view(torch.uint8),
+            base_backend.w2_weight.view(torch.uint8),
+        )
+
+        # The test weights drive outputs to ~1e5, where one BF16 ulp is 512-1024.
+        # Each shard rounds its partial FC2 sum to BF16 before the atomic add,
+        # one more rounding than the single kernel, and the two shards' atomic
+        # accumulation order moves some elements by one ulp between runs.
+        # Compare on the scale of the output rather than elementwise.
+        def assert_matches(out, ref, label):
+            out, ref = out.float(), ref.float()
+            rms_rel = ((out - ref).norm() / ref.norm()).item()
+            cos = torch.nn.functional.cosine_similarity(out.flatten(), ref.flatten(), dim=0).item()
+            assert rms_rel <= 1e-2 and cos >= 0.9999, (
+                f"{label}: rms_rel={rms_rel:.5f} cos={cos:.6f}"
+            )
+
+        with torch.inference_mode():
+            out_base = base_module(x, router_logits)
+            out_split = split_module(x, router_logits)
+        torch.cuda.synchronize()
+        assert_matches(out_split, out_base, "static split vs full GPU")
+
+        # Refit after the release: the reload re-creates the full parameters,
+        # the next transform re-shards and releases them again.
+        split_module.load_weights([weights])
+        split_module.transform_weights()
+        split_module.cache_derived_state()
+        assert_released(split_backend)
+        assert len(split_backend._locality_domain_weight_shards) == 2
+        with torch.inference_mode():
+            out_refit = split_module(x, router_logits)
+        torch.cuda.synchronize()
+        assert_matches(out_refit, out_base, "static split after refit vs full GPU")
+
+
+@pytest.mark.skipif(
     get_sm_version() != 107,
     reason="This test is only supported on SM 107 (Rubin) GPUs",
 )
@@ -5715,41 +5850,6 @@ def test_mxfp8_fused_fc12_sparse_gather_selection():
     assert not runner(1)._use_sparse_gather(num_rows=100, padded_routes=128)
 
 
-def test_mxfp8_moe_locality_domain_admission_rule():
-    """The inner-channel split is profiled up to the measured neutral point, never on prefill.
-
-    Qwen3.5-397B geometry (512 experts, top-k 10). ``num_tokens`` is the
-    number of rows this rank processes. Measured at the peak HBM clock with
-    the strict 100+100 SM split: wins from 2 to 1024 rows, neutral at 2048,
-    losses from 3072 rows up.
-    """
-    from tensorrt_llm._torch.moe.fused_moe.cutedsl.runners import CuteDslFusedMoEMxfp8Runner
-
-    def admits(num_tokens, num_local_experts):
-        return CuteDslFusedMoEMxfp8Runner.admits_locality_domain(
-            num_tokens, 10, num_local_experts, 512
-        )
-
-    # TEP8 (64 local experts), replicated input: measured wins 2..1024 rows,
-    # neutral at 2048 -> admitted; losses from 3072 up -> not profiled.
-    for tokens in (1, 2, 4, 8, 16, 21, 32, 64, 128, 256, 512, 1024, 2048):
-        assert admits(tokens, 64), tokens
-    for tokens in (3072, 4096, 16384):
-        assert not admits(tokens, 64), tokens
-    # DEP16 after alltoall dispatch (~340 rows) and DEP4 decode (~320 rows)
-    # are now profiled; DEP4 prefill (16K rows) is not.
-    assert admits(337, 32)
-    assert admits(320, 128)
-    assert not admits(16384, 128)
-    # Empty shapes stay on the full path.
-    assert not admits(0, 64)
-    assert admits(1, 64)
-    # With all experts local the estimated route count caps admission at 409
-    # rows (4096 routes); a full expert sweep of 2048 rows is not profiled.
-    assert admits(409, 512)
-    assert not admits(410, 512)
-
-
 @pytest.mark.skipif(
     not IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE,
     reason="MXFP8 fused FC12 MoE requires a CuTe DSL build that supports the fused FC12 kernel",
@@ -6223,20 +6323,11 @@ def test_mxfp8_local_input_quantization_deferred(monkeypatch, hidden, dtype):
     assert calls[0][0] is x and calls[0][1:] == (False, 512)
     assert sf.shape == (max_rows, scale_cols)
     # Locality domains: the split's parent reset quantizes raw input for both
-    # shards, so the fusion applies whatever the recorded decision says.
+    # shards, so the fusion applies to the split exactly as to the full op.
     backend._locality_domain_runtime = object()
-    backend.routing_method = SimpleNamespace(experts_per_token=10)
-    backend.expert_size_per_partition = 64
-    backend.num_slots = 512
-    backend._locality_domain_decisions = {}
     small = torch.empty((8, hidden), dtype=dtype)
-    for decision in (None, True, False):
-        if decision is None:
-            backend._locality_domain_decisions.pop(8, None)
-        else:
-            backend._locality_domain_decisions[8] = decision
-        raw, _ = impl.quantize_input(backend, small, post_quant_comm=False)
-        assert raw is small and len(calls) == 1
+    raw, _ = impl.quantize_input(backend, small, post_quant_comm=False)
+    assert raw is small and len(calls) == 1
     backend._locality_domain_runtime = None
     larger = torch.empty((max_rows + 1, hidden), dtype=dtype)
     quantized, _ = impl.quantize_input(backend, larger, post_quant_comm=False)
@@ -6255,8 +6346,6 @@ def test_mxfp8_input_quantization_tuning_cache_isolation():
             for dtype in (torch.float8_e4m3fn, torch.bfloat16, torch.float16)
         }
         assert len(keys) == 3
-    assert TrtllmCutedslFusedFc12Mxfp8Impl._decision_key(8, torch.float8_e4m3fn) == 8
-    assert TrtllmCutedslFusedFc12Mxfp8Impl._decision_key(8, torch.bfloat16) != 8
 
 
 @pytest.mark.parametrize("keeps_full_weights", [True, False])

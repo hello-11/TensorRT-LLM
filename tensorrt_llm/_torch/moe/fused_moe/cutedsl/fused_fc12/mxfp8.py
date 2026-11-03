@@ -19,23 +19,21 @@ FC1+FC2-fused CuteDSL MXFP8 MoE backend for Rubin (SM107) and Blackwell
 (``trtllm::cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin``, or its SM100 port
 ``..._blackwell``) does gather + FC1 GEMM + SwiGLU + MXFP8 requant + FC2 GEMM +
 top-k finalize (scatter-add into ``moe_output``): W8A8 e4m3 x e4m3 with UE8M0
-1x32 block scales. With locality domains (Rubin), small batches may instead
-split every expert's inner channels across the two domains, where the
-autotuner measures that to be faster.
+1x32 block scales. With locality domains (Rubin), the planner instead splits
+every expert's inner channels across the two domains for every shape of the
+layer; the shards are then the only copy of the expert weights.
 
 Its weights are the Cutlass MXFP8 layout plus a gate/up interleave of FC1
 (``MXFP8CuteDslFusedMoEMethod``). The kernel is a separate copy of the fused
 FC12 kernel the NVFP4 leaf runs, so the two share no code here.
 """
 
-import math
-
 import torch
 
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 
-from .....autotuner import AutoTuner, TunableRunner, TuningConfig
+from .....autotuner import AutoTuner
 from .....locality_domain.policy import PartitionPlan
 from .....locality_domain_utils import _copy_to_new_cuda_allocation
 from .....model_config import ModelConfig
@@ -108,10 +106,9 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
     # row, i.e. 16 * 32 = 512 K elements.
     _HIDDEN_ALIGNMENT = MXFP8CuteDslFusedMoEMethod.FC1_K_ALIGNMENT
 
-    # RLHF refit reloads the full parameters bucket by bucket and re-runs
-    # ``transform_weights``, which rebuilds the shards; so the full weights
-    # stay resident next to them (one extra copy of the expert weights).
-    _locality_domain_keeps_full_weights = True
+    # Released after the locality-domain split together with the full
+    # weights: the shards carry their own swizzled block scales.
+    _locality_domain_full_scale_params = ("w3_w1_weight_scale", "w2_weight_scale")
 
     # Raw BF16/FP16 activations with at most this many elements are quantized
     # inside the FC12 workspace-reset launch instead of a separate
@@ -124,12 +121,6 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
     # 8K-16K rows. 16M elements is 4096 rows of hidden 4096; above it the two
     # routes are equal, so prefill-sized inputs keep the native launch.
     FUSED_INPUT_QUANT_MAX_ELEMENTS = 1 << 24
-
-    # Minimum relative gain of the localized MoE over the full-GPU kernel
-    # (both as measured by the autotuner) before it is used for a token
-    # count. Measured decode gains are 2-16%; noise between two profiled ops
-    # is well under 1%.
-    _LOCALITY_DOMAIN_MIN_GAIN = 0.01
 
     # ------------------------------------------------------------------
     # Eligibility
@@ -250,9 +241,6 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
             model_config.moe_max_num_tokens,
             16384 * self.num_slots // routing_method.get_experts_per_token(),
         )
-        # Decision key -> whether the localized MoE runs for it
-        # (see _select_locality_domain).
-        self._locality_domain_decisions: dict[int | tuple[int, torch.dtype], bool] = {}
         # SM107 runs the Rubin kernel, SM100/SM103 its Blackwell port; both ops
         # share the input contract.
         self._sm_version = get_sm_version()
@@ -417,40 +405,16 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
 
         effective_top_k = token_selected_experts.size(-1)
         tuner = AutoTuner.get()
-        runner = CuteDslFusedMoEMxfp8Runner(
-            forward_impl=self.run_moe_mxfp8_impl,
-            num_experts=self.num_slots,
-            top_k=effective_top_k,
-            num_local_experts=self.expert_size_per_partition,
-            local_expert_offset=self.slot_start,
-            enable_alltoall=enable_alltoall,
-            tune_max_num_tokens=self.tune_max_num_tokens,
-        )
-        inputs = [x, token_selected_experts, token_final_scales, x_sf, moe_output]
-        tuning_config = runner.get_tuning_config()
-        _, best_tactic = tuner.choose_one(
-            self._tuner_key(x.dtype),
-            [runner],
-            tuning_config,
-            inputs,
-        )
-        # Raw (unquantized) activations are quantized by the split's parent
-        # reset launch just like by the full-GPU op's reset, so both paths
-        # accept them; the decision is keyed per input dtype.
-        if (
-            self._locality_domain_runtime is not None
-            and self._locality_domain_weight_shards is not None
-            and self._locality_domain_decisions.get(self._decision_key(x.size(0), x.dtype), True)
-            and CuteDslFusedMoEMxfp8Runner.admits_locality_domain(
-                x.size(0), effective_top_k, self.expert_size_per_partition, self.num_slots
+        # The locality-domain split is a static planner decision
+        # (``enable_locality_domains`` / ``plan_moe``), not a per-shape runtime
+        # choice: the full weights are released after sharding, so only the
+        # shards exist and every shape runs the split.
+        use_locality_domain = self._locality_domain_runtime is not None
+        if use_locality_domain:
+            assert self._locality_domain_weight_shards is not None, (
+                "locality-domain MXFP8 MoE needs transform_weights before the first forward"
             )
-        ):
-            # The inner-channel split is a separate autotuned op with its own
-            # tactic space. It is measured against the full-GPU op through the
-            # autotuner's recorded best times and only used where it wins by a
-            # margin, so shapes where it does not win run exactly the full-GPU
-            # path above. Shapes outside the admission rule never reach here.
-            locality_runner = CuteDslFusedMoEMxfp8Runner(
+            runner = CuteDslFusedMoEMxfp8Runner(
                 forward_impl=self._run_moe_mxfp8_locality_domain,
                 num_experts=self.num_slots,
                 top_k=effective_top_k,
@@ -460,23 +424,23 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
                 tune_max_num_tokens=self.tune_max_num_tokens,
                 workload_identity=self._locality_domain_workload_identity(x.dtype),
             )
-            locality_tuning_config = locality_runner.get_tuning_config()
-            _, locality_tactic = tuner.choose_one(
-                self._tuner_key(x.dtype, locality=True),
-                [locality_runner],
-                locality_tuning_config,
-                inputs,
+        else:
+            runner = CuteDslFusedMoEMxfp8Runner(
+                forward_impl=self.run_moe_mxfp8_impl,
+                num_experts=self.num_slots,
+                top_k=effective_top_k,
+                num_local_experts=self.expert_size_per_partition,
+                local_expert_offset=self.slot_start,
+                enable_alltoall=enable_alltoall,
+                tune_max_num_tokens=self.tune_max_num_tokens,
             )
-            if self._select_locality_domain(
-                tuner,
-                x.size(0),
-                runner,
-                tuning_config,
-                locality_runner,
-                locality_tuning_config,
-                inputs,
-            ):
-                return locality_runner(inputs, tactic=locality_tactic)
+        inputs = [x, token_selected_experts, token_final_scales, x_sf, moe_output]
+        _, best_tactic = tuner.choose_one(
+            self._tuner_key(x.dtype, locality=use_locality_domain),
+            [runner],
+            runner.get_tuning_config(),
+            inputs,
+        )
         return runner(inputs, tactic=best_tactic)
 
     @staticmethod
@@ -488,65 +452,6 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
         if dtype != torch.float8_e4m3fn:
             key += f"::input_quant::{dtype}"
         return key
-
-    @staticmethod
-    def _decision_key(num_tokens: int, dtype: torch.dtype) -> int | tuple[int, torch.dtype]:
-        """Keep E4M3 decisions keyed by row count and isolate raw-input ones."""
-        return num_tokens if dtype == torch.float8_e4m3fn else (num_tokens, dtype)
-
-    def _select_locality_domain(
-        self,
-        tuner: AutoTuner,
-        num_tokens: int,
-        full_runner: TunableRunner,
-        full_tuning_config: TuningConfig,
-        locality_runner: TunableRunner,
-        locality_tuning_config: TuningConfig,
-        inputs: list[torch.Tensor],
-    ) -> bool:
-        """Decide per token count whether the localized MoE runs.
-
-        Reads the best times the autotuner recorded for the full-GPU and the
-        localized op (persisted with the tuning cache, so the decision
-        survives a cache reload) and keeps the full-GPU op unless the
-        localized one is faster by ``_LOCALITY_DOMAIN_MIN_GAIN``. Missing or
-        unusable measurements (untuned shape, the distributed no-measurement
-        marker ``0.0``) keep the full-GPU op. The decision is cached per token
-        count (a cached ``False`` also skips the localized op's tuner lookup
-        on later forwards); it runs only for shapes that passed the static
-        admission rule.
-        """
-        decisions = self._locality_domain_decisions
-        decision_key = self._decision_key(num_tokens, inputs[0].dtype)
-        if decision_key in decisions:
-            return decisions[decision_key]
-        input_shapes = tuple(tuner._get_input_sizes(inputs))
-        hit_full, _, _, full_time = tuner.profiling_cache.search_cache(
-            self._tuner_key(inputs[0].dtype), [full_runner], input_shapes, full_tuning_config
-        )
-        hit_local, _, _, local_time = tuner.profiling_cache.search_cache(
-            self._tuner_key(inputs[0].dtype, locality=True),
-            [locality_runner],
-            input_shapes,
-            locality_tuning_config,
-        )
-        use_locality = bool(
-            hit_full
-            and hit_local
-            and full_time > 0.0
-            and math.isfinite(full_time)
-            and local_time > 0.0
-            and math.isfinite(local_time)
-            and local_time < (1.0 - self._LOCALITY_DOMAIN_MIN_GAIN) * full_time
-        )
-        if hit_full and hit_local:
-            logger.info(
-                f"{type(self).__name__} locality domain: num_tokens={num_tokens} "
-                f"full={full_time:.4f}ms localized={local_time:.4f}ms -> "
-                f"{'localized' if use_locality else 'full GPU'}"
-            )
-            decisions[decision_key] = use_locality
-        return use_locality
 
     def _memset_moe_output(
         self,
