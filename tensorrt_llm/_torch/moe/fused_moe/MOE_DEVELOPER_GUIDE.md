@@ -235,7 +235,7 @@ Still on old path (standalone, with embedded communication):
 | `cutedsl/grouped_gemm/` (+ the `fused_moe_cute_dsl.py` alias module) | the abstract `CuteDslFusedMoEBase` (aliased as `CuteDslFusedMoE`) and its two leaves, `TrtllmCutedslGroupedGemmNvfp4Impl` (`trtllm.cutedsl.grouped_gemm.nvfp4`) and `TrtllmCutedslGroupedGemmBf16Impl` (`trtllm.cutedsl.grouped_gemm.none`) | SM100/SM103/SM107; BF16 SM107 only | High throughput NVFP4, generally faster than Cutlass; unquantized BF16 SwiGLU on Rubin | `EXTERNAL_COMM` |
 | `fused_moe_cute_dsl_b12x.py` | `CuteDslB12xNvfp4FusedMoE` and `CuteDslB12xW4a16Nvfp4FusedMoE` (shared mixin `CuteDslB12xFusedMoEBase`, aliased as `CuteDslB12xFusedMoE`) | SM120/SM121 | NVFP4 (CUTLASS prefill, FlashInfer b12x decode) and W4A16 NVFP4 (b12x for every call), best on RTX PRO 6000 and DGX Spark. They head the `CUTEDSL` family, so they win on SM120/121 when flashinfer is present and yield to the grouped-GEMM leaves otherwise. BF16 activations only (`B12xMoEWrapper` reads and writes bfloat16), so a float16 layer falls back to Cutlass. The NVFP4 leaf also declines `force_dynamic_quantization` (`DYNAMIC_QUANT_UNSUPPORTED`): b12x quantizes decode activations against load-time scales, so such a layer falls back to Cutlass too. Single-GPU-shaped topology only: with no dispatch/combine kernel they reject `ep_size > 1` and attention-DP | `EXTERNAL_COMM` |
 | `cutedsl/fused_fc12/nvfp4.py` (+ the `fused_moe_cute_dsl_fc12.py` alias module) | `TrtllmCutedslFusedFc12Nvfp4Impl` (`trtllm.cutedsl.fused_fc12.nvfp4`, aliased as `CuteDslFc12FusedMoE`) | SM107 (Rubin) | NVFP4 fused FC1+FC2 in one persistent kernel (`cute_dsl_nvfp4_fc12_fused_rubin`) with a trace-time SwiGLU or SiTU epilogue, keeping the FC1→FC2 intermediate on-chip; shares `TrtllmCutedslGroupedGemmNvfp4Impl`'s NVFP4 weight layout and autotune runner; reachable through the `CUTEDSL_FC12` family or a pinned `impl_id`; needs `MoEDep.CUTEDSL_RUBIN`; non-uGPU | `EXTERNAL_COMM` |
-| `cutedsl/fused_fc12/mxfp8.py` | `TrtllmCutedslFusedFc12Mxfp8Impl` (`trtllm.cutedsl.fused_fc12.mxfp8`) | SM107 (Rubin) | MXFP8 (W8A8 e4m3 + UE8M0 1x32) fused FC1+SwiGLU+requant+FC2+finalize in one persistent kernel (`cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin`); the only CuteDSL leaf serving MXFP8, so `moe_backend: CUTEDSL` reaches it; SwiGLU only, requires `hidden_size % 512 == 0`; needs `MoEDep.CUTEDSL_RUBIN` and `MoEDep.CUTEDSL_MXFP8_FUSED_FC12`, without which the layer degrades to Cutlass; no EPLB (see [Rubin MXFP8 fused FC12](#rubin-mxfp8-fused-fc12-moekernelsrubin)) | `EXTERNAL_COMM` |
+| `cutedsl/fused_fc12/mxfp8.py` | `TrtllmCutedslFusedFc12Mxfp8Impl` (`trtllm.cutedsl.fused_fc12.mxfp8`) | SM107 (Rubin) | MXFP8 (W8A8 e4m3 + UE8M0 1x32) fused FC1+SwiGLU+requant+FC2+finalize in one persistent kernel (`cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin`); the only CuteDSL leaf serving MXFP8, so `moe_backend: CUTEDSL` reaches it; SwiGLU only, requires `hidden_size % 512 == 0`; needs `MoEDep.CUTEDSL_RUBIN` and `MoEDep.CUTEDSL_MXFP8_FUSED_FC12`, without which the layer degrades to Cutlass; no EPLB; uGPU split for small batches where it measures faster (see [Rubin MXFP8 fused FC12](#rubin-mxfp8-fused-fc12-moekernelsrubin)) | `EXTERNAL_COMM` |
 | `mega_moe/mega_moe_deepgemm.py` | `DeepgemmCudaW4a8Mxfp4Mxfp8Impl` (aliased as `MegaMoEDeepGemm`) | SM100/SM103/SM107 | W4A8_MXFP4_MXFP8 via DeepGEMM `fp8_fp4_mega_moe` fused dispatch+GEMM+act+GEMM+combine kernel; requires `hidden_size % 512 == 0` | `FUSED_COMM` |
 | `mega_moe/mega_moe_cute_dsl.py` | `TrtllmCutedslMegaMoeNvfp4Impl` (aliased as `MegaMoECuteDsl`) | SM100/SM103/SM107 | NVFP4 fused dispatch+FC1+act+FC2+combine; internally selects one of its per-architecture kernel variants. Requires CUDA 13 Cutlass DSL and a symmetric-memory provider. Uses uniform activation constants and applies routing weights before FC2 quantization for DeepSeek-V4, after FC2 for other models | `FUSED_COMM` |
 | `marlin/` (+ the `fused_moe_marlin.py` alias module) | the abstract `MarlinFusedMoEBase` and its two leaves, `MarlinCudaNvfp4Impl` and `MarlinCudaW4a16Nvfp4Impl` | SM89-SM99 | W4A16 NVFP4 on Ada/Hopper (BF16 activations + FP4 weights, single-launch `marlin_nvfp4_moe_gemm`); attention-DP + EP via external comm (plain BF16 dispatch payload); non-NVFP4 layers (e.g. unquantized MTP draft layers) degrade to Cutlass, recorded in the `MoEResolutionReport`; no dynamic EPLB | `EXTERNAL_COMM` |
@@ -414,7 +414,7 @@ the package.
 | `grouped_gemm/base.py` | `CuteDslFusedMoEBase`, the abstract root of the two grouped-GEMM leaves: construction, plus `CuteDslLocalityDomainMixin` |
 | `grouped_gemm/eligibility.py` | the checks both grouped-GEMM leaves' `can_implement` compose, as free functions |
 | `grouped_gemm/nvfp4.py` / `grouped_gemm/bf16.py` | one registered leaf each |
-| `locality_domain.py` | `CuteDslLocalityDomainMixin`: the output-memset overlap stream, the locality-domain plan and weight shards, and the lifecycle hooks around them; a mixin rather than a root, so leaves of different kernels take it |
+| `locality_domain.py` | `CuteDslLocalityDomainMixin`: the output-memset overlap stream, the locality-domain plan and weight shards, and the lifecycle hooks around them; a mixin rather than a root, so leaves of different kernels take it. A leaf vetoes a plan its kernel cannot split in `_adjust_locality_domain_plan`, and keeps its full weights after the split with `_locality_domain_keeps_full_weights` |
 | `fused_fc12/nvfp4.py` / `fused_fc12/mxfp8.py` | one registered leaf each: the two formats run separate copies of the fused FC12 kernel, so the leaves share no code |
 | `dense_gemm.py` | one registered leaf, with what only that kernel needs |
 
@@ -481,7 +481,12 @@ finalize (scatter-add) into one persistent kernel, driven through
 
 - Activations: e4m3 `[tokens, hidden]` plus **linear** UE8M0 scales
   `[tokens, hidden/32]` (`mxfp8_quantize(..., swizzled=False)`); the gather
-  warps read 16-byte scale chunks per row, hence `hidden % 512 == 0`.
+  warps read 16-byte scale chunks per row, hence `hidden % 512 == 0`. Without
+  communication, raw BF16/FP16 inputs up to 16M elements bound for the
+  full-GPU op are passed through unquantized and quantized inside the op's
+  workspace-reset launch (`fused_fc12_mxfp8_workspace.py` /
+  `mxfp8_input_quant.py`, bit-compatible with `mxfp8_quantize`), saving the
+  separate quantize launch.
 - Weights: e4m3 `[E, 2I, H]` / `[E, H, I]` with block scales in the 128x4
   swizzled layout produced by `block_scale_interleave` (int32-packed storage,
   viewed as bytes). FC1 weight and scales are gate/up interleaved at
@@ -490,14 +495,40 @@ finalize (scatter-add) into one persistent kernel, driven through
   projection of a finalized slot).
 - Per-expert `fc1_alpha` / `fc2_alpha` and the FC1 `norm_const` are 1.0 for
   MXFP8 (all scaling lives in the block scales).
-- The output is accumulated into, so `moe_output_memset_inplace` must run
-  first; the per-launch readiness/scheduler counters are zero-initialized
-  inside the op runner.
-- Tactic = `(mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler)` with
+- The output is accumulated into, so it must be zero on entry. In the dense
+  case (no all-to-all, or `ep_size <= top_k`) the op clears it inside its
+  workspace-reset launch (`zero_output`); otherwise the backend runs the
+  sparse `moe_output_memset_inplace` first. The readiness/scheduler counters
+  are cached per (device, tile count, locality domain) and cleared by that
+  same launch.
+- Tactic = `(mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler,
+  stream_weights, fc2_stream_weights)` with
   `mma_tiler_m == routing tile_size in {128, 256}`, `mma_n in {128, 256}`,
   `mma_tiler_k in {128, 256}`, cluster `(cta_group, 1)`, scheduler
-  `l2_atomic` / `static`. The outer `CuteDslFusedMoEMxfp8Runner` tunes the
-  routing tile and the comb checker pins the inner `mma_tiler_m` to it.
+  `l2_atomic` / `static`, and L2 evict-first weight loads for both GEMMs
+  (`stream_weights`) or for FC2 alone (`fc2_stream_weights`; only decoupled
+  for locality-domain shards). Shorter tactics from older caches normalize.
+  The outer `CuteDslFusedMoEMxfp8Runner` tunes the routing tile, anchored to
+  the module's saturation token count so decode buckets are always profiled,
+  and the comb checker pins the inner `mma_tiler_m` to it.
+- **Locality domains** (`enable_locality_domains`, `plan_moe` op
+  `mxfp8_moe`): `trtllm::cute_dsl_mxfp8_fused_fc12_moe_locality_domain_inplace_rubin`
+  runs the fused kernel on two compute partitions, each holding half of every
+  expert's inner channels (FC1 weights/scales sliced along N as whole gate/up
+  pairs and 128-row scale atoms, FC2 weights/scales along K; together one copy
+  of the weights). Both shards scatter-add into the shared, pre-zeroed output,
+  so the split is not bitwise equal to the full-GPU kernel. It is a separate
+  autotuned op: `run_moe_mxfp8` profiles it only for shapes passing
+  `CuteDslFusedMoEMxfp8Runner.admits_locality_domain` (at most 2048 rows and
+  ~4096 estimated local routes, the measured neutral point) and uses it for a
+  token count only when the autotuner's recorded time beats the full-GPU op
+  by at least 1%; every other shape runs the unchanged full-GPU path.
+  Measured on Rubin at the peak HBM clock with the strict 100+100 SM split
+  (TEP8, 64 local experts): -3 to -15% from 2 to 1024 rows (most at 16-32),
+  neutral at 2048, +3 to +22% from 3072 rows up and +20% on DEP4 prefill
+  (hence excluded). The leaf sets `_locality_domain_keeps_full_weights`, so
+  the full weights stay resident after sharding and RLHF refit can reload
+  them and rebuild the shards in `transform_weights`.
 - **DSL build requirement.** The kernel needs a newer internal Cutlass DSL
   than the bare `rubin_helpers` probe guarantees. `cute_dsl_utils.py` exposes
   `IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE` (true when `cutlass.memory` and
@@ -550,7 +581,8 @@ non-MoE consumers), the MoE files inside mixed directories (`marlin/`,
 | `test_moe_impl.py` | Selection and identity: what a resolution can get wrong (see the Identity Tests row under [Canonical Examples](#canonical-examples)) | Active |
 | `test_moe_module.py` | ConfigurableMoE integration tests (Backend × Comm × EPLB) | Active |
 | `test_mxfp8_moe_partial_refit.py` | MXFP8 bucketed-refit contract (swizzle / gate-up interleave applied exactly once) for the Cutlass and CuteDSL methods | Active |
-| `kernels/parallel/test_cute_dsl_moe.py` | CuteDSL MoE op-level tests, including the MXFP8 fused FC12 op against an fp32 reference | Active |
+| `kernels/parallel/test_cute_dsl_moe.py` | CuteDSL MoE op-level tests, including the MXFP8 fused FC12 op (full-GPU and locality-domain) against an fp32 reference | Active |
+| `kernels/parallel/test_mxfp8_input_quant.py` | The MXFP8 fused FC12 workspace reset: in-launch input quantization against `mxfp8_quantize`, output zeroing, CUDA-graph replay ordering | Active |
 | `test_fused_moe.py` | Legacy MoE tests | Being replaced, do NOT add new tests here |
 | `test_moe.py` | Legacy TRTLLM backend tests | Being replaced, do NOT add new tests here |
 

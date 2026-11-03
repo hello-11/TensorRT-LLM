@@ -17,18 +17,26 @@
 FC1+FC2-fused CuteDSL MXFP8 MoE backend for Rubin (SM107). One persistent kernel
 (``trtllm::cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin``) does gather + FC1
 GEMM + SwiGLU + MXFP8 requant + FC2 GEMM + top-k finalize (scatter-add into
-``moe_output``): W8A8 e4m3 x e4m3 with UE8M0 1x32 block scales.
+``moe_output``): W8A8 e4m3 x e4m3 with UE8M0 1x32 block scales. With locality
+domains, small batches may instead split every expert's inner channels across
+the two domains, where the autotuner measures that to be faster.
 
 Its weights are the Cutlass MXFP8 layout plus a gate/up interleave of FC1
 (``MXFP8CuteDslFusedMoEMethod``). The kernel is a separate copy of the fused
 FC12 kernel the NVFP4 leaf runs, so the two share no code here.
 """
 
+import math
+
 import torch
 
-from .....autotuner import AutoTuner
+from tensorrt_llm.logger import logger
+
+from .....autotuner import AutoTuner, TunableRunner, TuningConfig
+from .....locality_domain.policy import PartitionPlan
+from .....locality_domain_utils import _copy_to_new_cuda_allocation
 from .....model_config import ModelConfig
-from .....utils import ActivationType, AuxStreamType, EventType
+from .....utils import ActivationType, AuxStreamType, EventType, swizzle_sf, unswizzle_sf
 from ...activation import (
     DEFAULT_MOE_ACTIVATION,
     ActivationParamShape,
@@ -96,6 +104,29 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
     # The FC1 scale-factor gather reads 16-byte chunks of UE8M0 scales per
     # row, i.e. 16 * 32 = 512 K elements.
     _HIDDEN_ALIGNMENT = MXFP8CuteDslFusedMoEMethod.FC1_K_ALIGNMENT
+
+    # RLHF refit reloads the full parameters bucket by bucket and re-runs
+    # ``transform_weights``, which rebuilds the shards; so the full weights
+    # stay resident next to them (one extra copy of the expert weights).
+    _locality_domain_keeps_full_weights = True
+
+    # Raw BF16/FP16 activations with at most this many elements are quantized
+    # inside the FC12 workspace-reset launch instead of a separate
+    # ``mxfp8_quantize`` launch. Measured on Rubin at the peak HBM clock with
+    # rotating (cold) weights, CUDA-graph replays, native quantize + op vs
+    # the fused op, with both routes on the same tactic and again with each
+    # route autotuned: the fused route saves 1.5-2.8 us (the quantize launch)
+    # at every size from 1 to 256 rows of hidden 4096 and for hidden 2048
+    # and 7168, 3.5-7 us at 512-4096 rows, and is neutral within noise at
+    # 8K-16K rows. 16M elements is 4096 rows of hidden 4096; above it the two
+    # routes are equal, so prefill-sized inputs keep the native launch.
+    FUSED_INPUT_QUANT_MAX_ELEMENTS = 1 << 24
+
+    # Minimum relative gain of the localized MoE over the full-GPU kernel
+    # (both as measured by the autotuner) before it is used for a token
+    # count. Measured decode gains are 2-16%; noise between two profiled ops
+    # is well under 1%.
+    _LOCALITY_DOMAIN_MIN_GAIN = 0.01
 
     # ------------------------------------------------------------------
     # Eligibility
@@ -200,6 +231,18 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
         self.use_fused_finalize = (
             not model_config.moe_disable_finalize_fusion and model_config.lora_config is None
         )
+        # Anchors the autotuning buckets to the module's saturation token
+        # count (see CuteDslFusedMoEMxfp8Runner.get_tuning_config), so the
+        # decode buckets are profiled even when the warmup forward is large.
+        # Same cap as the Cutlass leaves: ~16k tokens per expert is well into
+        # the compute-bound domain, so profiling beyond it only costs time.
+        self.tune_max_num_tokens = min(
+            model_config.moe_max_num_tokens,
+            16384 * self.num_slots // routing_method.get_experts_per_token(),
+        )
+        # Decision key -> whether the localized MoE runs for it
+        # (see _select_locality_domain).
+        self._locality_domain_decisions: dict[int | tuple[int, torch.dtype], bool] = {}
         self._init_output_memset_and_locality_domain(model_config)
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
@@ -210,6 +253,18 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
             return
         self._check_quant_config_is_my_format()
         super().create_weights()
+
+    def _adjust_locality_domain_plan(self, plan: PartitionPlan) -> PartitionPlan:
+        if plan.enabled and self.intermediate_size_per_partition % (128 * plan.num_partitions) != 0:
+            reason = (
+                "MXFP8 locality domain MoE needs intermediate_size_per_partition "
+                f"({self.intermediate_size_per_partition}) to split into "
+                f"{plan.num_partitions} multiples of 128 channels; running the "
+                "full-GPU fused FC12 kernel"
+            )
+            logger.warning(f"{type(self).__name__}: {reason}")
+            return PartitionPlan(enabled=False, reason_if_disabled=reason)
+        return plan
 
     def _get_quant_method(self) -> object:
         # Cutlass MXFP8 storage/swizzle + the gate/up interleave the fused FC12
@@ -229,6 +284,47 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
     # ------------------------------------------------------------------
     # Input quantization and dispatch
     # ------------------------------------------------------------------
+    def _full_gpu_path_selected(self, num_tokens: int) -> bool:
+        """Whether ``run_moe_mxfp8`` will run the full-GPU op for this row count.
+
+        Without locality domains it always does. With them, the inner-channel
+        split runs only for row counts inside the static admission rule whose
+        recorded autotuner decision favours it. A row count with no recorded
+        decision yet may still profile the split on its first forward, so it
+        keeps the separate quantize launch until the decision exists; raw
+        activations therefore never reach the split shards. The lookup is a
+        host-side dict read that is baked into the CUDA graph per bucket.
+        """
+        if self._locality_domain_runtime is None:
+            return True
+        if not CuteDslFusedMoEMxfp8Runner.admits_locality_domain(
+            num_tokens,
+            self.routing_method.experts_per_token,
+            self.expert_size_per_partition,
+            self.num_slots,
+        ):
+            return True
+        return self._locality_domain_decisions.get(num_tokens) is False
+
+    def _fuses_input_quant(self, x: torch.Tensor) -> bool:
+        """Whether ``x`` is quantized inside the fused FC12 workspace reset.
+
+        The reset kernel uses aligned vector loads and writes one E8M0 scale
+        per 32 elements in linear order, hence the layout requirements. The
+        native quantizer pads the scale columns to ``weight_alignment`` while
+        the fused path writes exactly ``hidden / 32`` columns, so the two agree
+        only when the hidden size is a multiple of the weight alignment.
+        """
+        return (
+            x.dtype in (torch.bfloat16, torch.float16)
+            and x.dim() == 2
+            and x.is_contiguous()
+            and x.shape[1] % self.quant_method.BLOCK_SIZE == 0
+            and x.shape[1] % self.quant_method.weight_alignment == 0
+            and x.data_ptr() % 16 == 0
+            and x.numel() <= self.FUSED_INPUT_QUANT_MAX_ELEMENTS
+        )
+
     def quantize_input(
         self, x: torch.Tensor, post_quant_comm: bool = True
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -236,19 +332,32 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
 
         The fused FC12 kernel gathers the per-token scales row by row, so they
         are always produced in the linear layout, which is also what post-quant
-        communication transports.
+        communication transports. Without communication, a small enough input
+        that the full-GPU op will consume is left raw: the op quantizes it in
+        its workspace-reset launch, saving the separate quantize launch.
 
         Args:
             x: ``[num_tokens, hidden_size]`` bfloat16 activations.
-            post_quant_comm: Ignored; both paths produce the same layout.
+            post_quant_comm: Whether the result is dispatched; E4M3 travels on
+                the wire, so it is always quantized here.
 
         Returns:
             ``(x, x_sf)``: e4m3 ``[num_tokens, hidden_size]`` and uint8
-            ``[num_tokens, hidden_size // 32]`` scales.
+            ``[num_tokens, hidden_size // 32]`` scales; or, when quantization is
+            deferred to the op, ``x`` unchanged and an uninitialized scale
+            tensor of that shape, which carries shape metadata only.
         """
-        del post_quant_comm
         x_row = x.shape[0]
         sf_vec_size = self.quant_method.BLOCK_SIZE
+        if (
+            not post_quant_comm
+            and self._fuses_input_quant(x)
+            and self._full_gpu_path_selected(x_row)
+        ):
+            x_sf = torch.empty(
+                (x_row, x.shape[1] // sf_vec_size), dtype=torch.uint8, device=x.device
+            )
+            return x, x_sf
         x, x_sf = torch.ops.trtllm.mxfp8_quantize(
             x, False, alignment=self.quant_method.weight_alignment
         )
@@ -313,23 +422,257 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
         if token_selected_experts.size(0) == 0:
             return moe_output
 
+        effective_top_k = token_selected_experts.size(-1)
         tuner = AutoTuner.get()
         runner = CuteDslFusedMoEMxfp8Runner(
             forward_impl=self.run_moe_mxfp8_impl,
             num_experts=self.num_slots,
-            top_k=token_selected_experts.size(-1),
+            top_k=effective_top_k,
             num_local_experts=self.expert_size_per_partition,
             local_expert_offset=self.slot_start,
             enable_alltoall=enable_alltoall,
+            tune_max_num_tokens=self.tune_max_num_tokens,
         )
         inputs = [x, token_selected_experts, token_final_scales, x_sf, moe_output]
+        tuning_config = runner.get_tuning_config()
         _, best_tactic = tuner.choose_one(
-            "CuteDslFusedMoE::run_moe_mxfp8",
+            self._tuner_key(x.dtype),
             [runner],
-            runner.get_tuning_config(),
+            tuning_config,
             inputs,
         )
+        # Raw (unquantized) activations mean quantize_input already determined
+        # that the full-GPU op runs for this row count; the split shards never
+        # receive them (see _full_gpu_path_selected).
+        if (
+            self._locality_domain_runtime is not None
+            and self._locality_domain_weight_shards is not None
+            and x.dtype == torch.float8_e4m3fn
+            and self._locality_domain_decisions.get(self._decision_key(x.size(0), x.dtype), True)
+            and CuteDslFusedMoEMxfp8Runner.admits_locality_domain(
+                x.size(0), effective_top_k, self.expert_size_per_partition, self.num_slots
+            )
+        ):
+            # The inner-channel split is a separate autotuned op with its own
+            # tactic space. It is measured against the full-GPU op through the
+            # autotuner's recorded best times and only used where it wins by a
+            # margin, so shapes where it does not win run exactly the full-GPU
+            # path above. Shapes outside the admission rule never reach here.
+            locality_runner = CuteDslFusedMoEMxfp8Runner(
+                forward_impl=self._run_moe_mxfp8_locality_domain,
+                num_experts=self.num_slots,
+                top_k=effective_top_k,
+                num_local_experts=self.expert_size_per_partition,
+                local_expert_offset=self.slot_start,
+                enable_alltoall=enable_alltoall,
+                tune_max_num_tokens=self.tune_max_num_tokens,
+                workload_identity=self._locality_domain_workload_identity(x.dtype),
+            )
+            locality_tuning_config = locality_runner.get_tuning_config()
+            _, locality_tactic = tuner.choose_one(
+                self._tuner_key(x.dtype, locality=True),
+                [locality_runner],
+                locality_tuning_config,
+                inputs,
+            )
+            if self._select_locality_domain(
+                tuner,
+                x.size(0),
+                runner,
+                tuning_config,
+                locality_runner,
+                locality_tuning_config,
+                inputs,
+            ):
+                return locality_runner(inputs, tactic=locality_tactic)
         return runner(inputs, tactic=best_tactic)
+
+    @staticmethod
+    def _tuner_key(dtype: torch.dtype, locality: bool = False) -> str:
+        """Separate quantize/reset timing from the prequantized op cache."""
+        key = "CuteDslFusedMoE::run_moe_mxfp8"
+        if locality:
+            key += "::locality_domain"
+        if dtype != torch.float8_e4m3fn:
+            key += f"::input_quant::{dtype}"
+        return key
+
+    @staticmethod
+    def _decision_key(num_tokens: int, dtype: torch.dtype) -> int | tuple[int, torch.dtype]:
+        """Keep E4M3 decisions keyed by row count and isolate raw-input ones."""
+        return num_tokens if dtype == torch.float8_e4m3fn else (num_tokens, dtype)
+
+    def _select_locality_domain(
+        self,
+        tuner: AutoTuner,
+        num_tokens: int,
+        full_runner: TunableRunner,
+        full_tuning_config: TuningConfig,
+        locality_runner: TunableRunner,
+        locality_tuning_config: TuningConfig,
+        inputs: list[torch.Tensor],
+    ) -> bool:
+        """Decide per token count whether the localized MoE runs.
+
+        Reads the best times the autotuner recorded for the full-GPU and the
+        localized op (persisted with the tuning cache, so the decision
+        survives a cache reload) and keeps the full-GPU op unless the
+        localized one is faster by ``_LOCALITY_DOMAIN_MIN_GAIN``. Missing or
+        unusable measurements (untuned shape, the distributed no-measurement
+        marker ``0.0``) keep the full-GPU op. The decision is cached per token
+        count (a cached ``False`` also skips the localized op's tuner lookup
+        on later forwards); it runs only for shapes that passed the static
+        admission rule.
+        """
+        decisions = self._locality_domain_decisions
+        decision_key = self._decision_key(num_tokens, inputs[0].dtype)
+        if decision_key in decisions:
+            return decisions[decision_key]
+        input_shapes = tuple(tuner._get_input_sizes(inputs))
+        hit_full, _, _, full_time = tuner.profiling_cache.search_cache(
+            self._tuner_key(inputs[0].dtype), [full_runner], input_shapes, full_tuning_config
+        )
+        hit_local, _, _, local_time = tuner.profiling_cache.search_cache(
+            self._tuner_key(inputs[0].dtype, locality=True),
+            [locality_runner],
+            input_shapes,
+            locality_tuning_config,
+        )
+        use_locality = bool(
+            hit_full
+            and hit_local
+            and full_time > 0.0
+            and math.isfinite(full_time)
+            and local_time > 0.0
+            and math.isfinite(local_time)
+            and local_time < (1.0 - self._LOCALITY_DOMAIN_MIN_GAIN) * full_time
+        )
+        if hit_full and hit_local:
+            logger.info(
+                f"{type(self).__name__} locality domain: num_tokens={num_tokens} "
+                f"full={full_time:.4f}ms localized={local_time:.4f}ms -> "
+                f"{'localized' if use_locality else 'full GPU'}"
+            )
+            decisions[decision_key] = use_locality
+        return use_locality
+
+    def _memset_moe_output(
+        self,
+        moe_output: torch.Tensor,
+        tile_idx_to_mn_limit: torch.Tensor,
+        expanded_idx_to_permuted_idx: torch.Tensor,
+        permuted_idx_to_expanded_idx: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        tile_size: int,
+        top_k: int,
+        enable_alltoall: bool,
+    ) -> None:
+        """Zero the rows this rank finalizes, on the aux stream when available."""
+        memset_kwargs = dict(
+            input=moe_output,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=num_non_exiting_tiles,
+            tile_tokens_dim=tile_size,
+            top_k=top_k,
+            ep_size=self.mapping.moe_ep_size,
+            enable_alltoall=enable_alltoall,
+        )
+        if self._has_moe_output_memset_aux_stream():
+            memset_stream = self._moe_output_memset_run_stream()
+            self.event_dict[EventType.Main].record()
+            moe_output.record_stream(memset_stream)
+            with torch.cuda.stream(memset_stream):
+                self.event_dict[EventType.Main].wait()
+                torch.ops.trtllm.moe_output_memset_inplace(**memset_kwargs)
+                self.event_dict[EventType.MoeOutputMemset].record()
+            self.event_dict[EventType.MoeOutputMemset].wait()
+        else:
+            torch.ops.trtllm.moe_output_memset_inplace(**memset_kwargs)
+
+    def _run_moe_mxfp8_locality_domain(
+        self,
+        x: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        x_sf: torch.Tensor,
+        moe_output: torch.Tensor,
+        enable_alltoall: bool = False,
+        tile_size: int = 128,
+    ) -> torch.Tensor:
+        """MXFP8 MoE with the fused FC12 kernel split across two locality domains.
+
+        Each shard holds half of every expert's inner channels (FC1 columns as
+        whole gate/up pairs, FC2 rows of K) and both scatter-add their partial
+        FC2 result into the shared ``moe_output``, which the memset below
+        clears first. Routing metadata is shared. The split changes the BF16
+        accumulation order relative to the full-GPU kernel.
+        """
+        effective_top_k = token_selected_experts.size(1)
+        esp = self.expert_size_per_partition
+        slot_start = self.slot_start
+        shards = self._locality_domain_weight_shards
+
+        (
+            tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit,
+            expanded_idx_to_permuted_idx,
+            permuted_idx_to_expanded_idx,
+            total_num_padded_tokens,
+            num_non_exiting_tiles,
+        ) = torch.ops.trtllm.moe_sort(
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+            num_experts=self.num_slots,
+            top_k=effective_top_k,
+            local_expert_offset=slot_start,
+            local_num_experts=esp,
+            tile_tokens_dim=tile_size,
+        )
+
+        # Both shards accumulate into moe_output concurrently, so the op
+        # cannot clear it inside its own reset launch.
+        self._memset_moe_output(
+            moe_output,
+            tile_idx_to_mn_limit,
+            expanded_idx_to_permuted_idx,
+            permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles,
+            tile_size,
+            effective_top_k,
+            enable_alltoall,
+        )
+
+        fc_alpha, fc1_norm_const = self._fused_fc12_constants(x.device)
+        torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_locality_domain_inplace_rubin(
+            input=x,
+            fc1_weight_0=shards[0]["w3_w1_weight"],
+            fc1_weight_1=shards[1]["w3_w1_weight"],
+            input_scale=x_sf,
+            fc1_weight_scale_0=shards[0]["fc31_weight_block_scale"].view(torch.uint8),
+            fc1_weight_scale_1=shards[1]["fc31_weight_block_scale"].view(torch.uint8),
+            fc1_alpha=fc_alpha,
+            tile_idx_to_group_idx=tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=num_non_exiting_tiles,
+            fc1_norm_const=fc1_norm_const,
+            fc2_weight_0=shards[0]["w2_weight"],
+            fc2_weight_1=shards[1]["w2_weight"],
+            fc2_weight_scale_0=shards[0]["fc2_weight_block_scale"].view(torch.uint8),
+            fc2_weight_scale_1=shards[1]["fc2_weight_block_scale"].view(torch.uint8),
+            fc2_alpha=fc_alpha,
+            output=moe_output,
+            token_final_scales=token_final_scales,
+            num_experts=self.num_slots,
+            top_k=effective_top_k,
+            num_local_experts=esp,
+            local_expert_offset=slot_start,
+            tile_size=tile_size,
+            swiglu_limit=self.act_clamp,
+        )
+        return moe_output
 
     def run_moe_mxfp8_impl(
         self,
@@ -364,30 +707,24 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
         )
 
         # The fused finalize scatter-adds into moe_output, so the rows this
-        # rank produces must be zero on entry. Overlap the sparse memset with
-        # the routing metadata on the aux stream when one is available.
-        memset_kwargs = dict(
-            input=moe_output,
-            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
-            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
-            num_non_exiting_tiles=num_non_exiting_tiles,
-            tile_tokens_dim=tile_size,
-            top_k=effective_top_k,
-            ep_size=self.mapping.moe_ep_size,
-            enable_alltoall=enable_alltoall,
-        )
-        if self._has_moe_output_memset_aux_stream():
-            memset_stream = self._moe_output_memset_run_stream()
-            self.event_dict[EventType.Main].record()
-            moe_output.record_stream(memset_stream)
-            with torch.cuda.stream(memset_stream):
-                self.event_dict[EventType.Main].wait()
-                torch.ops.trtllm.moe_output_memset_inplace(**memset_kwargs)
-                self.event_dict[EventType.MoeOutputMemset].record()
-            self.event_dict[EventType.MoeOutputMemset].wait()
-        else:
-            torch.ops.trtllm.moe_output_memset_inplace(**memset_kwargs)
+        # rank produces must be zero on entry. In the dense case (the same
+        # condition under which moe_output_memset_inplace falls back to a full
+        # cudaMemsetAsync) the fused op clears the whole output inside its
+        # workspace reset launch, saving the memset launch and its aux-stream
+        # event pair. Alltoall with ep > top_k keeps the sparse row memset,
+        # overlapped with the routing metadata on the aux stream.
+        zero_output_in_kernel = not enable_alltoall or self.mapping.moe_ep_size <= effective_top_k
+        if not zero_output_in_kernel:
+            self._memset_moe_output(
+                moe_output,
+                tile_idx_to_mn_limit,
+                expanded_idx_to_permuted_idx,
+                permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles,
+                tile_size,
+                effective_top_k,
+                enable_alltoall,
+            )
 
         fc_alpha, fc1_norm_const = self._fused_fc12_constants(x.device)
         # The block scales are stored int32-packed (4 UE8M0 per int32 along
@@ -414,5 +751,73 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
             local_expert_offset=slot_start,
             tile_size=tile_size,
             swiglu_limit=self.act_clamp,
+            zero_output=zero_output_in_kernel,
         )
         return moe_output
+
+    # ------------------------------------------------------------------
+    # Locality domain
+    # ------------------------------------------------------------------
+    def _split_weights_for_locality_domain(self) -> list[dict[str, torch.Tensor]]:
+        """Split every expert's inner channels for the fused FC12 kernel.
+
+        FC1 weights ``[E, 2I, K]`` are sliced along N: the gate/up interleave
+        has granularity 64, so each half keeps whole pairs. FC2 weights
+        ``[E, K, I]`` are sliced along the inner (K) axis. The block scales are
+        stored in the 128x4 swizzled layout (int32-packed), whose memory order
+        is not the logical ``[N, K/32]`` matrix, so they are unswizzled, sliced
+        like their weights and swizzled again per shard. The two shards
+        together hold one copy of the weights.
+        """
+        num_p = self._locality_domain_plan.num_partitions
+        if num_p != 2:
+            raise ValueError(f"MXFP8 locality domain MoE supports two partitions, got {num_p}")
+        sf_vec = self.quant_method.BLOCK_SIZE
+        hidden = self.w2_weight.size(1)
+        inner = self.w2_weight.size(2)
+        fc1_n = self.w3_w1_weight.size(1)
+        assert fc1_n == 2 * inner, (fc1_n, inner)
+        half_inner = inner // num_p
+        num_experts = self.w2_weight.size(0)
+        fc1_scale = self.quant_scales.fc31_weight_block_scale
+        fc2_scale = self.quant_scales.fc2_weight_block_scale
+        assert fc1_scale.size(1) == fc1_n and fc2_scale.size(1) == hidden, (
+            fc1_scale.shape,
+            fc2_scale.shape,
+        )
+        # Linear [E, rows, cols / 32] byte views of the swizzled scales.
+        fc1_scale_linear = unswizzle_sf(fc1_scale.view(torch.uint8), fc1_n, hidden, sf_vec).view(
+            num_experts, fc1_n, hidden // sf_vec
+        )
+        fc2_scale_linear = unswizzle_sf(fc2_scale.view(torch.uint8), hidden, inner, sf_vec).view(
+            num_experts, hidden, inner // sf_vec
+        )
+        shards = []
+        for pid in range(num_p):
+            n_slice = slice(pid * 2 * half_inner, (pid + 1) * 2 * half_inner)
+            k_slice = slice(pid * half_inner, (pid + 1) * half_inner)
+            sk_slice = slice(pid * half_inner // sf_vec, (pid + 1) * half_inner // sf_vec)
+            fc1_shard_scale = (
+                swizzle_sf(
+                    fc1_scale_linear[:, n_slice].contiguous(), 2 * half_inner, hidden, sf_vec
+                )
+                .view(num_experts, 2 * half_inner, hidden // sf_vec)
+                .view(fc1_scale.dtype)
+            )
+            fc2_shard_scale = (
+                swizzle_sf(
+                    fc2_scale_linear[:, :, sk_slice].contiguous(), hidden, half_inner, sf_vec
+                )
+                .view(num_experts, hidden, half_inner // sf_vec)
+                .view(fc2_scale.dtype)
+            )
+            with self._locality_domain_runtime.partition_weight_context(pid):
+                shards.append(
+                    {
+                        "w3_w1_weight": _copy_to_new_cuda_allocation(self.w3_w1_weight[:, n_slice]),
+                        "w2_weight": _copy_to_new_cuda_allocation(self.w2_weight[:, :, k_slice]),
+                        "fc31_weight_block_scale": _copy_to_new_cuda_allocation(fc1_shard_scale),
+                        "fc2_weight_block_scale": _copy_to_new_cuda_allocation(fc2_shard_scale),
+                    }
+                )
+        return shards

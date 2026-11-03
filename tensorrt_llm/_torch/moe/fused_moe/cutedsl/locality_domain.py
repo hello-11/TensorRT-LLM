@@ -22,7 +22,7 @@ from typing import Any
 
 import torch
 
-from ....locality_domain.policy import LocalityDomainExecutionPlanner
+from ....locality_domain.policy import LocalityDomainExecutionPlanner, PartitionPlan
 from ....locality_domain.runtime import LocalityDomainRuntime
 from ....locality_domain_utils import _copy_to_new_cuda_allocation, get_reserved_remainder_stream
 from ....model_config import ModelConfig
@@ -42,6 +42,12 @@ class CuteDslLocalityDomainMixin:
     #: replaces with per-partition shards, released after the split.
     _locality_domain_full_scale_params: tuple[str, ...] = ()
 
+    #: Keep the full weights resident next to the shards. A leaf sets this
+    #: when its weights must stay loadable bucket by bucket after the split:
+    #: a reload then writes straight into the full tensors, and the next
+    #: ``transform_weights`` rebuilds the shards from them.
+    _locality_domain_keeps_full_weights: bool = False
+
     def _init_output_memset_and_locality_domain(self, model_config: ModelConfig) -> None:
         # Output-memset overlap is independent of MoE chunking, so ensure its
         # stream and events exist even if the parent creates no chunking event.
@@ -58,17 +64,23 @@ class CuteDslLocalityDomainMixin:
         self._locality_domain_runtime = None
         self._locality_domain_weight_shards = None  # set in transform_weights
         planner = LocalityDomainExecutionPlanner(model_config.locality_domain_policy)
-        self._locality_domain_plan = planner.plan_moe(
-            self.quant_config,
-            moe_backend=model_config.moe_backend,
-            use_fused_finalize=self.use_fused_finalize,
-            dtype_activation=self.dtype,
-            activation=ActivationType(self.activation_type).name,
+        self._locality_domain_plan = self._adjust_locality_domain_plan(
+            planner.plan_moe(
+                self.quant_config,
+                moe_backend=model_config.moe_backend,
+                use_fused_finalize=self.use_fused_finalize,
+                dtype_activation=self.dtype,
+                activation=ActivationType(self.activation_type).name,
+            )
         )
         if self._locality_domain_plan.enabled:
             self._locality_domain_runtime = LocalityDomainRuntime(
                 self._locality_domain_plan.num_partitions
             )
+
+    def _adjust_locality_domain_plan(self, plan: PartitionPlan) -> PartitionPlan:
+        """Veto a plan this leaf's kernel cannot split; returns it unchanged by default."""
+        return plan
 
     def _has_moe_output_memset_aux_stream(self) -> bool:
         event_dict = getattr(self, "event_dict", None)
@@ -136,7 +148,10 @@ class CuteDslLocalityDomainMixin:
         return {}
 
     def load_weights(self, weights: list[dict], allow_partial_loading: bool = False) -> None:
-        if self._locality_domain_weight_shards is not None:
+        if (
+            self._locality_domain_weight_shards is not None
+            and not self._locality_domain_keeps_full_weights
+        ):
             self.pre_reload_weights()
         super().load_weights(weights, allow_partial_loading=allow_partial_loading)
         # Keep DWDP registration after base weight loading. This preserves
@@ -155,7 +170,8 @@ class CuteDslLocalityDomainMixin:
             # Refresh views of finalized scales before copying their shards.
             self.quant_method.setup_quant_scales(self)
             self._locality_domain_weight_shards = self._split_weights_for_locality_domain()
-            self._release_full_weights_after_locality_domain_split()
+            if not self._locality_domain_keeps_full_weights:
+                self._release_full_weights_after_locality_domain_split()
 
     def cache_derived_state(self) -> None:
         super().cache_derived_state()

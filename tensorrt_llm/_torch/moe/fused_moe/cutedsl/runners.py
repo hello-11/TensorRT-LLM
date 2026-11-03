@@ -508,12 +508,25 @@ class CuteDslFusedMoEMxfp8Runner(TunableRunner):
     """Autotuner runner for the MXFP8 fused FC1+FC2 MoE on Rubin (SM107).
 
     Selects the routing tile size from {128, 256} and delegates to
-    ``forward_impl``, which drives the single fused FC1+FC2 CuTe DSL kernel.
-    The fused kernel has no B-reuse geometry, so the routing tile is exactly
-    the MMA tile M: 128 (1-CTA MMA) or 256 (2-CTA MMA).
+    ``forward_impl`` (the full-GPU fused FC1+FC2 kernel, or its inner-channel
+    split across two locality domains). The fused kernel has no B-reuse
+    geometry, so the routing tile is exactly the MMA tile M: 128 (1-CTA MMA)
+    or 256 (2-CTA MMA). ``workload_identity`` distinguishes the localized
+    runner's tuning cache entries (shard shapes and compute topology).
     """
 
     tuning_config_cache = dict()
+    # Static admission rule for profiling the locality-domain split. The
+    # measured selection (1% margin against the full-GPU op) decides whether
+    # it runs; this rule only bounds the extra autotuner warmup by excluding
+    # shapes where the split cannot win. Paired Rubin measurements at the peak
+    # HBM clock with the engine's strict 100+100 SM split (TEP8, 64 local
+    # experts): the split wins from 2 to 1024 rows (-3 to -15% vs the tuned
+    # full-GPU kernel), is neutral at 2048 and loses from 3072 rows up,
+    # reaching +22% at 16K, so the cap sits at the neutral point. The route
+    # cap keeps prefill-like full expert sweeps out regardless of EP layout.
+    LOCALITY_DOMAIN_MAX_TOKENS = 2048
+    LOCALITY_DOMAIN_MAX_LOCAL_ROUTES = 4096
 
     def __init__(
         self,
@@ -524,6 +537,8 @@ class CuteDslFusedMoEMxfp8Runner(TunableRunner):
         local_expert_offset: int,
         enable_alltoall: bool = False,
         output_dtype: torch.dtype = torch.bfloat16,
+        tune_max_num_tokens: int | None = None,
+        workload_identity: tuple | None = None,
     ) -> None:
         super().__init__()
         self.forward_impl = forward_impl
@@ -534,6 +549,26 @@ class CuteDslFusedMoEMxfp8Runner(TunableRunner):
         self.enable_alltoall = enable_alltoall
         assert output_dtype == torch.bfloat16
         self.output_dtype = output_dtype
+        self.tune_max_num_tokens = tune_max_num_tokens
+        self.workload_identity = workload_identity
+
+    @classmethod
+    def admits_locality_domain(
+        cls, num_tokens: int, top_k: int, num_local_experts: int, num_experts: int
+    ) -> bool:
+        """Static shape rule for profiling the locality-domain split.
+
+        ``num_tokens`` is the number of rows this rank processes (after
+        alltoall dispatch, if any). The valid local route count is estimated
+        as in ``Sm107Mxfp8FusedFc12MoeRunner._use_sparse_gather``:
+        ``num_tokens * top_k`` scaled by the rank's share of the experts,
+        never below one route per row.
+        """
+        if num_tokens <= 0 or num_tokens > cls.LOCALITY_DOMAIN_MAX_TOKENS:
+            return False
+        local_routes = -(-num_tokens * top_k * num_local_experts // num_experts)
+        local_routes = max(num_tokens, local_routes)
+        return local_routes <= cls.LOCALITY_DOMAIN_MAX_LOCAL_ROUTES
 
     def unique_id(self) -> tuple:
         return (
@@ -543,6 +578,8 @@ class CuteDslFusedMoEMxfp8Runner(TunableRunner):
             self.local_expert_offset,
             self.enable_alltoall,
             self.output_dtype,
+            self.tune_max_num_tokens,
+            self.workload_identity,
         )
 
     def get_valid_tactics(
@@ -567,12 +604,18 @@ class CuteDslFusedMoEMxfp8Runner(TunableRunner):
             )
             # MXFP8 inputs: [x, token_selected_experts, token_final_scales,
             #                x_sf, moe_output]
+            # ``tune_max_num_tokens`` anchors the power-of-two token buckets to
+            # the module's saturation token count instead of the warmup
+            # forward's token count, so the decode buckets (a few tokens per
+            # DP rank) are always profiled; the nested fused-kernel tuning runs
+            # for each of them.
             self.__class__.tuning_config_cache[key] = TuningConfig(
                 dynamic_tensor_specs=(
                     DynamicTensorSpec(
                         0, 0, get_last_power_of_2_num_tokens_buckets, last_positive_power_of_2
                     ),
                 ),
+                tune_max_num_tokens=self.tune_max_num_tokens,
                 constraint_specs=(
                     ConstraintSpec(1, 0, helper.infer_shape_num_tokens),
                     ConstraintSpec(2, 0, helper.infer_shape_num_tokens),
