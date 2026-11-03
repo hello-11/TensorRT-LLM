@@ -297,28 +297,6 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
     # ------------------------------------------------------------------
     # Input quantization and dispatch
     # ------------------------------------------------------------------
-    def _full_gpu_path_selected(self, num_tokens: int) -> bool:
-        """Whether ``run_moe_mxfp8`` will run the full-GPU op for this row count.
-
-        Without locality domains it always does. With them, the inner-channel
-        split runs only for row counts inside the static admission rule whose
-        recorded autotuner decision favours it. A row count with no recorded
-        decision yet may still profile the split on its first forward, so it
-        keeps the separate quantize launch until the decision exists; raw
-        activations therefore never reach the split shards. The lookup is a
-        host-side dict read that is baked into the CUDA graph per bucket.
-        """
-        if self._locality_domain_runtime is None:
-            return True
-        if not CuteDslFusedMoEMxfp8Runner.admits_locality_domain(
-            num_tokens,
-            self.routing_method.experts_per_token,
-            self.expert_size_per_partition,
-            self.num_slots,
-        ):
-            return True
-        return self._locality_domain_decisions.get(num_tokens) is False
-
     def _fuses_input_quant(self, x: torch.Tensor) -> bool:
         """Whether ``x`` is quantized inside the fused FC12 workspace reset.
 
@@ -351,8 +329,9 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
         The fused FC12 kernel gathers the per-token scales row by row, so they
         are always produced in the linear layout, which is also what post-quant
         communication transports. Without communication, a small enough input
-        that the full-GPU op will consume is left raw: the op quantizes it in
-        its workspace-reset launch, saving the separate quantize launch.
+        is left raw: the full-GPU op and the locality-domain split both
+        quantize it in their (single) workspace-reset launch, saving the
+        separate quantize launch.
 
         Args:
             x: ``[num_tokens, hidden_size]`` bfloat16 activations.
@@ -367,11 +346,7 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
         """
         x_row = x.shape[0]
         sf_vec_size = self.quant_method.BLOCK_SIZE
-        if (
-            not post_quant_comm
-            and self._fuses_input_quant(x)
-            and self._full_gpu_path_selected(x_row)
-        ):
+        if not post_quant_comm and self._fuses_input_quant(x):
             x_sf = torch.empty(
                 (x_row, x.shape[1] // sf_vec_size), dtype=torch.uint8, device=x.device
             )
@@ -459,13 +434,12 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
             tuning_config,
             inputs,
         )
-        # Raw (unquantized) activations mean quantize_input already determined
-        # that the full-GPU op runs for this row count; the split shards never
-        # receive them (see _full_gpu_path_selected).
+        # Raw (unquantized) activations are quantized by the split's parent
+        # reset launch just like by the full-GPU op's reset, so both paths
+        # accept them; the decision is keyed per input dtype.
         if (
             self._locality_domain_runtime is not None
             and self._locality_domain_weight_shards is not None
-            and x.dtype == torch.float8_e4m3fn
             and self._locality_domain_decisions.get(self._decision_key(x.size(0), x.dtype), True)
             and CuteDslFusedMoEMxfp8Runner.admits_locality_domain(
                 x.size(0), effective_top_k, self.expert_size_per_partition, self.num_slots
@@ -623,9 +597,10 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
 
         Each shard holds half of every expert's inner channels (FC1 columns as
         whole gate/up pairs, FC2 rows of K) and both scatter-add their partial
-        FC2 result into the shared ``moe_output``, which the memset below
-        clears first. Routing metadata is shared. The split changes the BF16
-        accumulation order relative to the full-GPU kernel.
+        FC2 result into the shared ``moe_output``, which the op's parent reset
+        launch clears first (dense case). Routing metadata is shared and raw
+        activations are quantized by that same launch. The split changes the
+        BF16 accumulation order relative to the full-GPU kernel.
         """
         effective_top_k = token_selected_experts.size(1)
         esp = self.expert_size_per_partition
@@ -649,18 +624,21 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
             tile_tokens_dim=tile_size,
         )
 
-        # Both shards accumulate into moe_output concurrently, so the op
-        # cannot clear it inside its own reset launch.
-        self._memset_moe_output(
-            moe_output,
-            tile_idx_to_mn_limit,
-            expanded_idx_to_permuted_idx,
-            permuted_idx_to_expanded_idx,
-            num_non_exiting_tiles,
-            tile_size,
-            effective_top_k,
-            enable_alltoall,
-        )
+        # Same rule as run_moe_mxfp8_impl: in the dense case the op's parent
+        # reset launch clears the whole output for both shards before the
+        # fork; alltoall with ep > top_k keeps the sparse row memset.
+        zero_output_in_kernel = not enable_alltoall or self.mapping.moe_ep_size <= effective_top_k
+        if not zero_output_in_kernel:
+            self._memset_moe_output(
+                moe_output,
+                tile_idx_to_mn_limit,
+                expanded_idx_to_permuted_idx,
+                permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles,
+                tile_size,
+                effective_top_k,
+                enable_alltoall,
+            )
 
         fc_alpha, fc1_norm_const = self._fused_fc12_constants(x.device)
         torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_locality_domain_inplace_rubin(
@@ -689,6 +667,7 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
             local_expert_offset=slot_start,
             tile_size=tile_size,
             swiglu_limit=self.act_clamp,
+            zero_output=zero_output_in_kernel,
         )
         return moe_output
 

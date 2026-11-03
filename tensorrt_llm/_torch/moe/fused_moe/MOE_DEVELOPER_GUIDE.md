@@ -482,8 +482,8 @@ finalize (scatter-add) into one persistent kernel, driven through
 - Activations: e4m3 `[tokens, hidden]` plus **linear** UE8M0 scales
   `[tokens, hidden/32]` (`mxfp8_quantize(..., swizzled=False)`); the gather
   warps read 16-byte scale chunks per row, hence `hidden % 512 == 0`. Without
-  communication, raw BF16/FP16 inputs up to 16M elements bound for the
-  full-GPU op are passed through unquantized and quantized inside the op's
+  communication, raw BF16/FP16 inputs up to 16M elements are passed through
+  unquantized and quantized inside the op's
   workspace-reset launch (`fused_fc12_mxfp8_workspace.py` /
   `mxfp8_input_quant.py`, bit-compatible with `mxfp8_quantize`), saving the
   separate quantize launch.
@@ -516,8 +516,12 @@ finalize (scatter-add) into one persistent kernel, driven through
   runs the fused kernel on two compute partitions, each holding half of every
   expert's inner channels (FC1 weights/scales sliced along N as whole gate/up
   pairs and 128-row scale atoms, FC2 weights/scales along K; together one copy
-  of the weights). Both shards scatter-add into the shared, pre-zeroed output,
-  so the split is not bitwise equal to the full-GPU kernel. It is a separate
+  of the weights). One parent reset launch on the caller's stream clears both
+  partitions' synchronization workspaces, the shared output (`zero_output`,
+  dense case) and quantizes raw BF16/FP16 input once before the fork, so the
+  split pays the same single reset as the full-GPU op and the shards launch
+  GEMM-only. Both shards scatter-add into the shared output, so the split is
+  not bitwise equal to the full-GPU kernel. It is a separate
   autotuned op: `run_moe_mxfp8` profiles it only for shapes passing
   `CuteDslFusedMoEMxfp8Runner.admits_locality_domain` (at most 2048 rows and
   ~4096 estimated local routes, the measured neutral point) and uses it for a
