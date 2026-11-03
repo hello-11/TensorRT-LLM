@@ -148,11 +148,15 @@ class CuteDslLocalityDomainMixin:
         return {}
 
     def load_weights(self, weights: list[dict], allow_partial_loading: bool = False) -> None:
-        if (
-            self._locality_domain_weight_shards is not None
-            and not self._locality_domain_keeps_full_weights
-        ):
-            self.pre_reload_weights()
+        if self._locality_domain_weight_shards is not None:
+            if self._locality_domain_keeps_full_weights:
+                # The load rewrites the resident full weights, so the shards
+                # copied from them are stale whether or not the caller ran
+                # pre_reload_weights; the next transform rebuilds them.
+                self._locality_domain_weight_shards = None
+                self._weights_transformed = False
+            else:
+                self.pre_reload_weights()
         super().load_weights(weights, allow_partial_loading=allow_partial_loading)
         # Keep DWDP registration after base weight loading. This preserves
         # loaded tensors for collector setup and remains compatible with the

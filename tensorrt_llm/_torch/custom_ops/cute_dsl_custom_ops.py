@@ -19671,191 +19671,192 @@ if IS_CUTLASS_DSL_AVAILABLE:
             ) -> None:
                 return None
 
-        _MXFP8_FUSED_FC12_LOCALITY_ARGS = (
-            "(Tensor input, Tensor fc1_weight_0, Tensor fc1_weight_1, "
-            "Tensor input_scale, Tensor fc1_weight_scale_0, Tensor fc1_weight_scale_1, "
-            "Tensor fc1_alpha, Tensor tile_idx_to_group_idx, Tensor tile_idx_to_mn_limit, "
-            "Tensor permuted_idx_to_expanded_idx, Tensor num_non_exiting_tiles, "
-            "Tensor fc1_norm_const, Tensor fc2_weight_0, Tensor fc2_weight_1, "
-            "Tensor fc2_weight_scale_0, Tensor fc2_weight_scale_1, Tensor fc2_alpha, "
-            "Tensor(a17!) output, Tensor token_final_scales, "
-            "SymInt num_experts, SymInt top_k, SymInt num_local_experts, "
-            "SymInt local_expert_offset, SymInt tile_size, "
-            f"float swiglu_limit={SWIGLU_LIMIT_SCALAR_DISABLED}) -> ()")
+            # Shares the runner above, so it exists only where that does.
+            _MXFP8_FUSED_FC12_LOCALITY_ARGS = (
+                "(Tensor input, Tensor fc1_weight_0, Tensor fc1_weight_1, "
+                "Tensor input_scale, Tensor fc1_weight_scale_0, Tensor fc1_weight_scale_1, "
+                "Tensor fc1_alpha, Tensor tile_idx_to_group_idx, Tensor tile_idx_to_mn_limit, "
+                "Tensor permuted_idx_to_expanded_idx, Tensor num_non_exiting_tiles, "
+                "Tensor fc1_norm_const, Tensor fc2_weight_0, Tensor fc2_weight_1, "
+                "Tensor fc2_weight_scale_0, Tensor fc2_weight_scale_1, Tensor fc2_alpha, "
+                "Tensor(a17!) output, Tensor token_final_scales, "
+                "SymInt num_experts, SymInt top_k, SymInt num_local_experts, "
+                "SymInt local_expert_offset, SymInt tile_size, "
+                f"float swiglu_limit={SWIGLU_LIMIT_SCALAR_DISABLED}) -> ()")
 
-        def _check_locality_shards(name: str, shard_0: torch.Tensor,
-                                   shard_1: torch.Tensor) -> None:
-            if shard_0.shape != shard_1.shape or shard_0.dtype != shard_1.dtype:
-                raise ValueError(
-                    f"locality domain MXFP8 fused FC12 MoE {name} shards must have "
-                    f"identical shapes and dtypes, got {tuple(shard_0.shape)} "
-                    f"{shard_0.dtype} and {tuple(shard_1.shape)} {shard_1.dtype}."
-                )
+            def _check_locality_shards(name: str, shard_0: torch.Tensor,
+                                       shard_1: torch.Tensor) -> None:
+                if shard_0.shape != shard_1.shape or shard_0.dtype != shard_1.dtype:
+                    raise ValueError(
+                        f"locality domain MXFP8 fused FC12 MoE {name} shards must have "
+                        f"identical shapes and dtypes, got {tuple(shard_0.shape)} "
+                        f"{shard_0.dtype} and {tuple(shard_1.shape)} {shard_1.dtype}."
+                    )
 
-        @torch.library.custom_op(
-            "trtllm::cute_dsl_mxfp8_fused_fc12_moe_locality_domain_inplace_rubin",
-            mutates_args=("output", ),
-            schema=_MXFP8_FUSED_FC12_LOCALITY_ARGS,
-            device_types="cuda")
-        def cute_dsl_mxfp8_fused_fc12_moe_locality_domain_inplace_rubin(
-            input: torch.Tensor,
-            fc1_weight_0: torch.Tensor,
-            fc1_weight_1: torch.Tensor,
-            input_scale: torch.Tensor,
-            fc1_weight_scale_0: torch.Tensor,
-            fc1_weight_scale_1: torch.Tensor,
-            fc1_alpha: torch.Tensor,
-            tile_idx_to_group_idx: torch.Tensor,
-            tile_idx_to_mn_limit: torch.Tensor,
-            permuted_idx_to_expanded_idx: torch.Tensor,
-            num_non_exiting_tiles: torch.Tensor,
-            fc1_norm_const: torch.Tensor,
-            fc2_weight_0: torch.Tensor,
-            fc2_weight_1: torch.Tensor,
-            fc2_weight_scale_0: torch.Tensor,
-            fc2_weight_scale_1: torch.Tensor,
-            fc2_alpha: torch.Tensor,
-            output: torch.Tensor,
-            token_final_scales: torch.Tensor,
-            num_experts: int,
-            top_k: int,
-            num_local_experts: int,
-            local_expert_offset: int,
-            tile_size: int,
-            swiglu_limit: float = SWIGLU_LIMIT_SCALAR_DISABLED,
-        ) -> None:
-            """Tune and launch both locality-domain shards of the MXFP8 fused FC12 MoE.
-
-            Each shard holds half of every expert's inner channels: FC1 weights
-            and scales sliced along N (whole gate/up pairs), FC2 weights and
-            scales sliced along K. Both shards see all local experts and routes,
-            so the routing metadata is shared, and both scatter-add their partial
-            FC2 result into ``output`` through the fused finalize. ``output`` must
-            therefore be zero on entry for the rows this rank produces; the op
-            never clears it itself because the two partitions run concurrently.
-            Splitting FC2 changes the BF16 accumulation order, so results agree
-            with the full-GPU kernel within the MoE tolerances, not bitwise.
-
-            The MoE outer runner invokes this op during preparation so locality
-            domain resources, tactics and kernels are ready before CUDA graph
-            capture. Direct callers must likewise invoke it once before capture.
-            """
-            _check_locality_shards("FC1 weight", fc1_weight_0, fc1_weight_1)
-            _check_locality_shards("FC1 weight-scale", fc1_weight_scale_0,
-                                   fc1_weight_scale_1)
-            _check_locality_shards("FC2 weight", fc2_weight_0, fc2_weight_1)
-            _check_locality_shards("FC2 weight-scale", fc2_weight_scale_0,
-                                   fc2_weight_scale_1)
-            if fc2_weight_0.size(2) * 2 != fc1_weight_0.size(1):
-                raise ValueError(
-                    "locality domain MXFP8 fused FC12 MoE shards must split the "
-                    f"inner channels: FC2 K {fc2_weight_0.size(2)} vs FC1 N "
-                    f"{fc1_weight_0.size(1)}.")
-
-            runtime = LocalityDomainRuntime(num_partitions=2)
-            tuner_key = (
-                "trtllm::cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin::locality_domain"
-            )
-            if input.dtype != torch.float8_e4m3fn:
-                tuner_key += f"::input_quant::{input.dtype}"
-            op_runner = Sm107Mxfp8FusedFc12MoeRunner(
-                num_experts,
-                top_k,
-                num_local_experts,
-                local_expert_offset,
-                tile_size,
-                swiglu_limit=swiglu_limit,
-                zero_output=False,
-                decouple_fc2_cache_policy=True,
-            )
-            # Input order matches Sm107Mxfp8FusedFc12InputsHelper (shard 0).
-            inputs = [
-                input, fc1_weight_0, input_scale, fc1_weight_scale_0, fc1_alpha,
-                tile_idx_to_group_idx, tile_idx_to_mn_limit,
-                permuted_idx_to_expanded_idx, num_non_exiting_tiles,
-                fc1_norm_const, fc2_weight_0, fc2_weight_scale_0, fc2_alpha,
-                output, token_final_scales
-            ]
-
-            def launch_partition(
-                partition_id: int,
-                partition_inputs: List[torch.Tensor],
-                tactic,
+            @torch.library.custom_op(
+                "trtllm::cute_dsl_mxfp8_fused_fc12_moe_locality_domain_inplace_rubin",
+                mutates_args=("output", ),
+                schema=_MXFP8_FUSED_FC12_LOCALITY_ARGS,
+                device_types="cuda")
+            def cute_dsl_mxfp8_fused_fc12_moe_locality_domain_inplace_rubin(
+                input: torch.Tensor,
+                fc1_weight_0: torch.Tensor,
+                fc1_weight_1: torch.Tensor,
+                input_scale: torch.Tensor,
+                fc1_weight_scale_0: torch.Tensor,
+                fc1_weight_scale_1: torch.Tensor,
+                fc1_alpha: torch.Tensor,
+                tile_idx_to_group_idx: torch.Tensor,
+                tile_idx_to_mn_limit: torch.Tensor,
+                permuted_idx_to_expanded_idx: torch.Tensor,
+                num_non_exiting_tiles: torch.Tensor,
+                fc1_norm_const: torch.Tensor,
+                fc2_weight_0: torch.Tensor,
+                fc2_weight_1: torch.Tensor,
+                fc2_weight_scale_0: torch.Tensor,
+                fc2_weight_scale_1: torch.Tensor,
+                fc2_alpha: torch.Tensor,
+                output: torch.Tensor,
+                token_final_scales: torch.Tensor,
+                num_experts: int,
+                top_k: int,
+                num_local_experts: int,
+                local_expert_offset: int,
+                tile_size: int,
+                swiglu_limit: float = SWIGLU_LIMIT_SCALAR_DISABLED,
             ) -> None:
-                fc1_weight = fc1_weight_0 if partition_id == 0 else fc1_weight_1
-                fc1_weight_scale = (fc1_weight_scale_0 if partition_id == 0 else
-                                    fc1_weight_scale_1)
-                fc2_weight = fc2_weight_0 if partition_id == 0 else fc2_weight_1
-                fc2_weight_scale = (fc2_weight_scale_0 if partition_id == 0 else
-                                    fc2_weight_scale_1)
-                torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin(
-                    input=partition_inputs[0],
-                    fc1_weight=fc1_weight,
-                    input_scale=partition_inputs[2],
-                    fc1_weight_scale=fc1_weight_scale,
-                    fc1_alpha=partition_inputs[4],
-                    tile_idx_to_group_idx=partition_inputs[5],
-                    tile_idx_to_mn_limit=partition_inputs[6],
-                    permuted_idx_to_expanded_idx=partition_inputs[7],
-                    num_non_exiting_tiles=partition_inputs[8],
-                    fc1_norm_const=partition_inputs[9],
-                    fc2_weight=fc2_weight,
-                    fc2_weight_scale=fc2_weight_scale,
-                    fc2_alpha=partition_inputs[12],
-                    output=partition_inputs[13],
-                    token_final_scales=partition_inputs[14],
-                    num_experts=num_experts,
-                    top_k=top_k,
-                    num_local_experts=num_local_experts,
-                    local_expert_offset=local_expert_offset,
-                    tile_size=tile_size,
-                    swiglu_limit=swiglu_limit,
-                    precomputed_tactic=repr(tactic),
-                    zero_output=False,
+                """Tune and launch both locality-domain shards of the MXFP8 fused FC12 MoE.
+
+                Each shard holds half of every expert's inner channels: FC1 weights
+                and scales sliced along N (whole gate/up pairs), FC2 weights and
+                scales sliced along K. Both shards see all local experts and routes,
+                so the routing metadata is shared, and both scatter-add their partial
+                FC2 result into ``output`` through the fused finalize. ``output`` must
+                therefore be zero on entry for the rows this rank produces; the op
+                never clears it itself because the two partitions run concurrently.
+                Splitting FC2 changes the BF16 accumulation order, so results agree
+                with the full-GPU kernel within the MoE tolerances, not bitwise.
+
+                The MoE outer runner invokes this op during preparation so locality
+                domain resources, tactics and kernels are ready before CUDA graph
+                capture. Direct callers must likewise invoke it once before capture.
+                """
+                _check_locality_shards("FC1 weight", fc1_weight_0, fc1_weight_1)
+                _check_locality_shards("FC1 weight-scale", fc1_weight_scale_0,
+                                       fc1_weight_scale_1)
+                _check_locality_shards("FC2 weight", fc2_weight_0, fc2_weight_1)
+                _check_locality_shards("FC2 weight-scale", fc2_weight_scale_0,
+                                       fc2_weight_scale_1)
+                if fc2_weight_0.size(2) * 2 != fc1_weight_0.size(1):
+                    raise ValueError(
+                        "locality domain MXFP8 fused FC12 MoE shards must split the "
+                        f"inner channels: FC2 K {fc2_weight_0.size(2)} vs FC1 N "
+                        f"{fc1_weight_0.size(1)}.")
+
+                runtime = LocalityDomainRuntime(num_partitions=2)
+                tuner_key = (
+                    "trtllm::cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin::locality_domain"
                 )
+                if input.dtype != torch.float8_e4m3fn:
+                    tuner_key += f"::input_quant::{input.dtype}"
+                op_runner = Sm107Mxfp8FusedFc12MoeRunner(
+                    num_experts,
+                    top_k,
+                    num_local_experts,
+                    local_expert_offset,
+                    tile_size,
+                    swiglu_limit=swiglu_limit,
+                    zero_output=False,
+                    decouple_fc2_cache_policy=True,
+                )
+                # Input order matches Sm107Mxfp8FusedFc12InputsHelper (shard 0).
+                inputs = [
+                    input, fc1_weight_0, input_scale, fc1_weight_scale_0, fc1_alpha,
+                    tile_idx_to_group_idx, tile_idx_to_mn_limit,
+                    permuted_idx_to_expanded_idx, num_non_exiting_tiles,
+                    fc1_norm_const, fc2_weight_0, fc2_weight_scale_0, fc2_alpha,
+                    output, token_final_scales
+                ]
 
-            runner, best_tactic = tune_locality_domain_concurrent(
-                tuner_key,
-                op_runner,
-                runtime,
-                2,
-                launch_partition,
-                inputs,
-                op_runner.get_tuning_config(),
+                def launch_partition(
+                    partition_id: int,
+                    partition_inputs: List[torch.Tensor],
+                    tactic,
+                ) -> None:
+                    fc1_weight = fc1_weight_0 if partition_id == 0 else fc1_weight_1
+                    fc1_weight_scale = (fc1_weight_scale_0 if partition_id == 0 else
+                                        fc1_weight_scale_1)
+                    fc2_weight = fc2_weight_0 if partition_id == 0 else fc2_weight_1
+                    fc2_weight_scale = (fc2_weight_scale_0 if partition_id == 0 else
+                                        fc2_weight_scale_1)
+                    torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin(
+                        input=partition_inputs[0],
+                        fc1_weight=fc1_weight,
+                        input_scale=partition_inputs[2],
+                        fc1_weight_scale=fc1_weight_scale,
+                        fc1_alpha=partition_inputs[4],
+                        tile_idx_to_group_idx=partition_inputs[5],
+                        tile_idx_to_mn_limit=partition_inputs[6],
+                        permuted_idx_to_expanded_idx=partition_inputs[7],
+                        num_non_exiting_tiles=partition_inputs[8],
+                        fc1_norm_const=partition_inputs[9],
+                        fc2_weight=fc2_weight,
+                        fc2_weight_scale=fc2_weight_scale,
+                        fc2_alpha=partition_inputs[12],
+                        output=partition_inputs[13],
+                        token_final_scales=partition_inputs[14],
+                        num_experts=num_experts,
+                        top_k=top_k,
+                        num_local_experts=num_local_experts,
+                        local_expert_offset=local_expert_offset,
+                        tile_size=tile_size,
+                        swiglu_limit=swiglu_limit,
+                        precomputed_tactic=repr(tactic),
+                        zero_output=False,
+                    )
+
+                runner, best_tactic = tune_locality_domain_concurrent(
+                    tuner_key,
+                    op_runner,
+                    runtime,
+                    2,
+                    launch_partition,
+                    inputs,
+                    op_runner.get_tuning_config(),
+                )
+                runner(inputs, tactic=best_tactic)
+
+            @torch.library.register_fake(
+                "trtllm::cute_dsl_mxfp8_fused_fc12_moe_locality_domain_inplace_rubin"
             )
-            runner(inputs, tactic=best_tactic)
-
-        @torch.library.register_fake(
-            "trtllm::cute_dsl_mxfp8_fused_fc12_moe_locality_domain_inplace_rubin"
-        )
-        def _(
-            input: torch.Tensor,
-            fc1_weight_0: torch.Tensor,
-            fc1_weight_1: torch.Tensor,
-            input_scale: torch.Tensor,
-            fc1_weight_scale_0: torch.Tensor,
-            fc1_weight_scale_1: torch.Tensor,
-            fc1_alpha: torch.Tensor,
-            tile_idx_to_group_idx: torch.Tensor,
-            tile_idx_to_mn_limit: torch.Tensor,
-            permuted_idx_to_expanded_idx: torch.Tensor,
-            num_non_exiting_tiles: torch.Tensor,
-            fc1_norm_const: torch.Tensor,
-            fc2_weight_0: torch.Tensor,
-            fc2_weight_1: torch.Tensor,
-            fc2_weight_scale_0: torch.Tensor,
-            fc2_weight_scale_1: torch.Tensor,
-            fc2_alpha: torch.Tensor,
-            output: torch.Tensor,
-            token_final_scales: torch.Tensor,
-            num_experts: int,
-            top_k: int,
-            num_local_experts: int,
-            local_expert_offset: int,
-            tile_size: int,
-            swiglu_limit: float = SWIGLU_LIMIT_SCALAR_DISABLED,
-        ) -> None:
-            return None
+            def _(
+                input: torch.Tensor,
+                fc1_weight_0: torch.Tensor,
+                fc1_weight_1: torch.Tensor,
+                input_scale: torch.Tensor,
+                fc1_weight_scale_0: torch.Tensor,
+                fc1_weight_scale_1: torch.Tensor,
+                fc1_alpha: torch.Tensor,
+                tile_idx_to_group_idx: torch.Tensor,
+                tile_idx_to_mn_limit: torch.Tensor,
+                permuted_idx_to_expanded_idx: torch.Tensor,
+                num_non_exiting_tiles: torch.Tensor,
+                fc1_norm_const: torch.Tensor,
+                fc2_weight_0: torch.Tensor,
+                fc2_weight_1: torch.Tensor,
+                fc2_weight_scale_0: torch.Tensor,
+                fc2_weight_scale_1: torch.Tensor,
+                fc2_alpha: torch.Tensor,
+                output: torch.Tensor,
+                token_final_scales: torch.Tensor,
+                num_experts: int,
+                top_k: int,
+                num_local_experts: int,
+                local_expert_offset: int,
+                tile_size: int,
+                swiglu_limit: float = SWIGLU_LIMIT_SCALAR_DISABLED,
+            ) -> None:
+                return None
 
         # ----------------------------------------------------------------
         # Rubin BF16/FP16 Finalize Fusion (FC2 layer: grouped GEMM + scatter-add)

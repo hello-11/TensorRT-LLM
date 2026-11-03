@@ -43,6 +43,7 @@ from tensorrt_llm._torch.locality_domain_utils import (
     start_for_all_locality_domain,
 )
 from tensorrt_llm._torch.moe.fused_moe.cutedsl import (
+    TrtllmCutedslFusedFc12Mxfp8Impl,
     TrtllmCutedslGroupedGemmBf16Impl,
     TrtllmCutedslGroupedGemmNvfp4Impl,
 )
@@ -6159,20 +6160,18 @@ def test_mxfp8_local_input_quantization_deferred(monkeypatch, hidden, dtype):
     """
     from tensorrt_llm._torch.moe.fused_moe.cutedsl.runners import CuteDslFusedMoEMxfp8Runner
 
+    impl = TrtllmCutedslFusedFc12Mxfp8Impl
+    # Only the Rubin op fuses the quantization, so the fake runs as SM107.
     backend = SimpleNamespace(
-        has_nvfp4=False,
-        has_mxfp8=True,
         hidden_size=hidden,
-        scaling_vector_size=32,
         quant_method=SimpleNamespace(BLOCK_SIZE=32, weight_alignment=512),
+        _sm_version=107,
         _locality_domain_runtime=None,
-        MXFP8_FUSED_INPUT_QUANT_MAX_ELEMENTS=CuteDslFusedMoE.MXFP8_FUSED_INPUT_QUANT_MAX_ELEMENTS,
+        FUSED_INPUT_QUANT_MAX_ELEMENTS=impl.FUSED_INPUT_QUANT_MAX_ELEMENTS,
     )
-    backend._fuses_mxfp8_input_quant = CuteDslFusedMoE._fuses_mxfp8_input_quant.__get__(backend)
-    backend._mxfp8_full_gpu_path_selected = CuteDslFusedMoE._mxfp8_full_gpu_path_selected.__get__(
-        backend
-    )
-    max_rows = CuteDslFusedMoE.MXFP8_FUSED_INPUT_QUANT_MAX_ELEMENTS // hidden
+    backend._fuses_input_quant = impl._fuses_input_quant.__get__(backend)
+    backend._full_gpu_path_selected = impl._full_gpu_path_selected.__get__(backend)
+    max_rows = impl.FUSED_INPUT_QUANT_MAX_ELEMENTS // hidden
     scale_cols = hidden // 32
     calls = []
 
@@ -6186,11 +6185,11 @@ def test_mxfp8_local_input_quantization_deferred(monkeypatch, hidden, dtype):
     monkeypatch.setattr(torch.ops.trtllm, "mxfp8_quantize", native_quantize)
     for rows in (0, 1, max_rows):
         x = torch.empty((rows, hidden), dtype=dtype)
-        raw, sf = CuteDslFusedMoE.quantize_input(backend, x, post_quant_comm=False)
+        raw, sf = impl.quantize_input(backend, x, post_quant_comm=False)
         assert raw is x and sf.shape == (rows, scale_cols) and sf.dtype == torch.uint8
     assert not calls
     x = torch.empty((max_rows, hidden), dtype=dtype)
-    quantized, sf = CuteDslFusedMoE.quantize_input(backend, x, post_quant_comm=True)
+    quantized, sf = impl.quantize_input(backend, x, post_quant_comm=True)
     assert quantized.dtype == torch.float8_e4m3fn and len(calls) == 1
     assert calls[0][0] is x and calls[0][1:] == (False, 512)
     assert sf.shape == (max_rows, scale_cols)
@@ -6202,34 +6201,34 @@ def test_mxfp8_local_input_quantization_deferred(monkeypatch, hidden, dtype):
     backend.routing_method = SimpleNamespace(experts_per_token=10)
     backend.expert_size_per_partition = 64
     backend.num_slots = 512
-    backend._mxfp8_locality_domain_decisions = {}
+    backend._locality_domain_decisions = {}
     small = torch.empty((8, hidden), dtype=dtype)
-    quantized, _ = CuteDslFusedMoE.quantize_input(backend, small, post_quant_comm=False)
+    quantized, _ = impl.quantize_input(backend, small, post_quant_comm=False)
     assert quantized.dtype == torch.float8_e4m3fn and len(calls) == 2
-    backend._mxfp8_locality_domain_decisions[8] = True
-    quantized, _ = CuteDslFusedMoE.quantize_input(backend, small, post_quant_comm=False)
+    backend._locality_domain_decisions[8] = True
+    quantized, _ = impl.quantize_input(backend, small, post_quant_comm=False)
     assert quantized.dtype == torch.float8_e4m3fn and len(calls) == 3
-    backend._mxfp8_locality_domain_decisions[8] = False
-    raw, _ = CuteDslFusedMoE.quantize_input(backend, small, post_quant_comm=False)
+    backend._locality_domain_decisions[8] = False
+    raw, _ = impl.quantize_input(backend, small, post_quant_comm=False)
     assert raw is small and len(calls) == 3
     assert not CuteDslFusedMoEMxfp8Runner.admits_locality_domain(
         CuteDslFusedMoEMxfp8Runner.LOCALITY_DOMAIN_MAX_TOKENS + 1, 10, 64, 512
     )
     if (CuteDslFusedMoEMxfp8Runner.LOCALITY_DOMAIN_MAX_TOKENS + 1) * hidden <= (
-        CuteDslFusedMoE.MXFP8_FUSED_INPUT_QUANT_MAX_ELEMENTS
+        impl.FUSED_INPUT_QUANT_MAX_ELEMENTS
     ):
         outside = torch.empty(
             (CuteDslFusedMoEMxfp8Runner.LOCALITY_DOMAIN_MAX_TOKENS + 1, hidden), dtype=dtype
         )
-        raw, _ = CuteDslFusedMoE.quantize_input(backend, outside, post_quant_comm=False)
+        raw, _ = impl.quantize_input(backend, outside, post_quant_comm=False)
         assert raw is outside and len(calls) == 3
     backend._locality_domain_runtime = None
     larger = torch.empty((max_rows + 1, hidden), dtype=dtype)
-    quantized, _ = CuteDslFusedMoE.quantize_input(backend, larger, post_quant_comm=False)
+    quantized, _ = impl.quantize_input(backend, larger, post_quant_comm=False)
     assert quantized.dtype == torch.float8_e4m3fn and len(calls) == 4
     # Non-contiguous rows cannot be vector-loaded by the reset kernel.
     strided = torch.empty((2, hidden * 2), dtype=dtype)[:, :hidden]
-    quantized, _ = CuteDslFusedMoE.quantize_input(backend, strided, post_quant_comm=False)
+    quantized, _ = impl.quantize_input(backend, strided, post_quant_comm=False)
     assert quantized.dtype == torch.float8_e4m3fn and len(calls) == 5
 
 
@@ -6237,9 +6236,44 @@ def test_mxfp8_input_quantization_tuning_cache_isolation():
     """Changing activation dtype must not reuse prequantized timing decisions."""
     for locality in (False, True):
         keys = {
-            CuteDslFusedMoE._mxfp8_tuner_key(dtype, locality)
+            TrtllmCutedslFusedFc12Mxfp8Impl._tuner_key(dtype, locality)
             for dtype in (torch.float8_e4m3fn, torch.bfloat16, torch.float16)
         }
         assert len(keys) == 3
-    assert CuteDslFusedMoE._mxfp8_decision_key(8, torch.float8_e4m3fn) == 8
-    assert CuteDslFusedMoE._mxfp8_decision_key(8, torch.bfloat16) != 8
+    assert TrtllmCutedslFusedFc12Mxfp8Impl._decision_key(8, torch.float8_e4m3fn) == 8
+    assert TrtllmCutedslFusedFc12Mxfp8Impl._decision_key(8, torch.bfloat16) != 8
+
+
+@pytest.mark.parametrize("keeps_full_weights", [True, False])
+def test_locality_domain_reload_drops_stale_shards(keeps_full_weights):
+    """A reload without pre_reload_weights must not leave shards built from old weights.
+
+    A leaf that keeps its full weights resident takes the reload in place, so
+    load_weights drops the shards and re-arms transform_weights itself; any
+    other leaf goes through pre_reload_weights.
+    """
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl.locality_domain import (
+        CuteDslLocalityDomainMixin,
+    )
+
+    calls = []
+
+    class _Owner:
+        def load_weights(self, weights, allow_partial_loading=False):
+            calls.append("load")
+
+        def pre_reload_weights(self):
+            calls.append("pre_reload")
+
+    class _Leaf(CuteDslLocalityDomainMixin, _Owner):
+        _locality_domain_keeps_full_weights = keeps_full_weights
+
+    leaf = _Leaf()
+    leaf._locality_domain_weight_shards = [{}, {}]
+    leaf._weights_transformed = True
+
+    leaf.load_weights([{}], allow_partial_loading=True)
+
+    assert leaf._locality_domain_weight_shards is None
+    assert leaf._weights_transformed is False
+    assert calls == (["load"] if keeps_full_weights else ["pre_reload", "load"])
