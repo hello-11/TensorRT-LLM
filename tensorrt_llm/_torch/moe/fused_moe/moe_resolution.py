@@ -31,6 +31,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from .activation import MoEActivation, SwigluActivation, activation_constant_names
 from .cutedsl import (
     TrtllmCutedslDenseGemmNvfp4Impl,
+    TrtllmCutedslFusedFc12Mxfp8Impl,
     TrtllmCutedslFusedFc12Nvfp4Impl,
     TrtllmCutedslGroupedGemmBf16Impl,
     TrtllmCutedslGroupedGemmNvfp4Impl,
@@ -107,6 +108,8 @@ IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
     TrtllmCutedslGroupedGemmNvfp4Impl,
     TrtllmCutedslGroupedGemmBf16Impl,
     TrtllmCutedslFusedFc12Nvfp4Impl,
+    # The only CuteDSL leaf publishing ``mxfp8``.
+    TrtllmCutedslFusedFc12Mxfp8Impl,
     # The TRTLLM-Gen leaves. FlashInfer sits ahead of the native leaf
     # for the same format because the opt-in flag is what selects it: with the
     # flag unset every FlashInfer leaf rejects in ``check_flashinfer_provider``
@@ -149,6 +152,9 @@ BACKEND_FAMILY: Dict[str, FrozenSet[MoEImplClass]] = {
             CuteDslB12xW4a16Nvfp4FusedMoE,
             TrtllmCutedslGroupedGemmNvfp4Impl,
             TrtllmCutedslGroupedGemmBf16Impl,
+            # ``moe_backend: CUTEDSL`` is how an MXFP8 checkpoint reaches the
+            # CuteDSL fused FC12 kernel; no grouped-GEMM leaf serves MXFP8.
+            TrtllmCutedslFusedFc12Mxfp8Impl,
         }
     ),
     "CUTEDSL_FC12": frozenset({TrtllmCutedslFusedFc12Nvfp4Impl}),
