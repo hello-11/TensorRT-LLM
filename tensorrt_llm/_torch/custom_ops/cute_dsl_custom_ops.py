@@ -19771,8 +19771,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
                 # Input order matches Sm107Mxfp8FusedFc12InputsHelper (shard 0).
                 inputs = [
-                    input, fc1_weight_0, input_scale, fc1_weight_scale_0, fc1_alpha,
-                    tile_idx_to_group_idx, tile_idx_to_mn_limit,
+                    input, fc1_weight_0, input_scale, fc1_weight_scale_0,
+                    fc1_alpha, tile_idx_to_group_idx, tile_idx_to_mn_limit,
                     permuted_idx_to_expanded_idx, num_non_exiting_tiles,
                     fc1_norm_const, fc2_weight_0, fc2_weight_scale_0, fc2_alpha,
                     output, token_final_scales
@@ -19784,11 +19784,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     tactic,
                 ) -> None:
                     fc1_weight = fc1_weight_0 if partition_id == 0 else fc1_weight_1
-                    fc1_weight_scale = (fc1_weight_scale_0 if partition_id == 0 else
-                                        fc1_weight_scale_1)
+                    fc1_weight_scale = (fc1_weight_scale_0 if partition_id == 0
+                                        else fc1_weight_scale_1)
                     fc2_weight = fc2_weight_0 if partition_id == 0 else fc2_weight_1
-                    fc2_weight_scale = (fc2_weight_scale_0 if partition_id == 0 else
-                                        fc2_weight_scale_1)
+                    fc2_weight_scale = (fc2_weight_scale_0 if partition_id == 0
+                                        else fc2_weight_scale_1)
                     torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin(
                         input=partition_inputs[0],
                         fc1_weight=fc1_weight,

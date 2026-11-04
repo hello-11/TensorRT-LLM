@@ -6252,9 +6252,7 @@ def test_locality_domain_reload_drops_stale_shards(keeps_full_weights):
     load_weights drops the shards and re-arms transform_weights itself; any
     other leaf goes through pre_reload_weights.
     """
-    from tensorrt_llm._torch.moe.fused_moe.cutedsl.locality_domain import (
-        CuteDslLocalityDomainMixin,
-    )
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl.locality_domain import CuteDslLocalityDomainMixin
 
     calls = []
 
